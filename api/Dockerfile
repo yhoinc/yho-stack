@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN apt-get update && apt-get install -y --no-install-recommends \
     sqlite3 ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# requirements.txt is inside api/
+# requirements.txt lives in api/
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
