@@ -1,4 +1,4 @@
-app = "yho-stack-api"
+app = "yho-stack-api-yhoinc"
 
 [build]
   dockerfile = "api/Dockerfile"
