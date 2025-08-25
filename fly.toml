@@ -1,4 +1,4 @@
-app = "yho-stack"   # keep this as your Fly app name
+app = "yho-stack-api"   # keep this as your Fly app name
 
 [build]
   dockerfile = "api/Dockerfile"
