@@ -1,324 +1,304 @@
-﻿"use client";
+"use client";
+
 import * as React from "react";
 import {
-    Box, Button, Stack, TextField, Typography, Tabs, Tab, MenuItem,
-    Select, FormControl, InputLabel
+  Box,
+  Stack,
+  TextField,
+  MenuItem,
+  Button,
+  Typography,
+  Alert,
 } from "@mui/material";
 import { DataGrid, GridColDef } from "@mui/x-data-grid";
-import DownloadIcon from "@mui/icons-material/Download";
-import RefreshIcon from "@mui/icons-material/Refresh";
-import * as XLSX from "xlsx";
 
-// --- helpers ---
-const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+const API_BASE =
+  (process.env.NEXT_PUBLIC_API_BASE as string | undefined) ?? "/api";
 
-type HoursByCompanyRow = { company: string | null; run_date: string; total_hours: number };
-type HoursByEmployeeRow = { employee_id: string; name: string; company: string | null; run_date: string; total_hours: number };
-type PayoutByCompanyRow = { company: string | null; run_date: string; total_payout: number };
-type PayoutByEmployeeRow = { employee_id: string; name: string; company: string | null; run_date: string; total_paid: number };
-type CommissionRow = { beneficiary: string; run_date: string; per_hour_rate: number; source_hours: number; total_commission: number };
+type RowAny = Record<string, any>;
 
-function useFetchRows<T>(endpoint: string, params: Record<string, any>) {
-    const [rows, setRows] = React.useState<T[]>([]);
-    const [loading, setLoading] = React.useState(false);
-
-    const fetchRows = React.useCallback(async () => {
-        setLoading(true);
-        try {
-            const base = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/+$/, "");
-            const usp = new URLSearchParams();
-            Object.entries(params).forEach(([k, v]) => {
-                if (v !== undefined && v !== null && String(v).trim() !== "") usp.set(k, String(v));
-            });
-            const url = `${base}${endpoint}${usp.toString() ? `?${usp.toString()}` : ""}`;
-            console.log("[reports] GET", url); // 👈 log the exact URL
-            const r = await fetch(url);
-            if (!r.ok) {
-                const txt = await r.text();
-                console.error("GET failed", endpoint, r.status, txt);
-                alert(`API error: ${endpoint}\n${r.status}\n${txt}`);
-                setRows([]);
-                return;
-            }
-            const d = await r.json();
-            setRows((d?.rows ?? []) as T[]);
-        } catch (e: any) {
-            console.error("Fetch error", endpoint, e);
-            alert(`Network error fetching ${endpoint}:\n${e?.message || e}`);
-            setRows([]);
-        } finally {
-            setLoading(false);
-        }
-    }, [endpoint, params]);
-
-    React.useEffect(() => { fetchRows(); }, [fetchRows]);
-    return { rows, loading, refetch: fetchRows, setRows };
-}
-
-function exportSheet(name: string, data: any[]) {
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(data);
-    XLSX.utils.book_append_sheet(wb, ws, name);
-    XLSX.writeFile(wb, `${name.toLowerCase().replace(/\s+/g, "_")}.xlsx`);
+async function fetchJSON(path: string) {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`HTTP ${res.status} for ${url}\n${text}`);
+  }
+  return res.json();
 }
 
 export default function ReportsPage() {
-    const [tab, setTab] = React.useState(0);
+  // filters
+  const [dateFrom, setDateFrom] = React.useState<string>("");
+  const [dateTo, setDateTo] = React.useState<string>("");
+  const [companyFilter, setCompanyFilter] = React.useState<string>("");
 
-    // Shared filters (ISO: YYYY-MM-DD). Leave blank for no bounds.
-    const [dateFrom, setDateFrom] = React.useState<string>("");
-    const [dateTo, setDateTo] = React.useState<string>("");
+  // data + states
+  const [payoutByCompany, setPayoutByCompany] = React.useState<RowAny[]>([]);
+  const [payoutByEmployee, setPayoutByEmployee] = React.useState<RowAny[]>([]);
+  const [hoursByEmployee, setHoursByEmployee] = React.useState<RowAny[]>([]);
+  const [commissions, setCommissions] = React.useState<RowAny[]>([]);
+  const [loading, setLoading] = React.useState(false);
+  const [err, setErr] = React.useState<string>("");
 
-    // Company filter for employee-based summaries
-    const [company, setCompany] = React.useState<string>("");
+  // load companies for the filter (optional – derived from payoutByCompany)
+  const companies = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const r of payoutByCompany) {
+      if (r.company) set.add(r.company);
+    }
+    return Array.from(set).sort();
+  }, [payoutByCompany]);
 
-    // Commission filter
-    const [beneficiary, setBeneficiary] = React.useState<string>("");
+  const buildQS = (params: Record<string, string | null | undefined>) => {
+    const q = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v != null && v !== "") q.set(k, v);
+    }
+    const s = q.toString();
+    return s ? `?${s}` : "";
+    };
 
-    // ---- Tab 0: Hours by company ----
-    const hoursByCompany = useFetchRows<HoursByCompanyRow>(
-        "/payroll/summary/hours_by_company",
-        { date_from: dateFrom || undefined, date_to: dateTo || undefined }
-    );
-    const hoursByCompanyCols: GridColDef<HoursByCompanyRow>[] = [
-        { field: "run_date", headerName: "Run Date", minWidth: 130 },
-        { field: "company", headerName: "Company", minWidth: 160, flex: 1 },
-        { field: "total_hours", headerName: "Total Hours", minWidth: 140, valueFormatter: (p) => (p.value ?? 0).toFixed(2) },
-    ];
+  async function load() {
+    setLoading(true);
+    setErr("");
+    try {
+      const qs = buildQS({ date_from: dateFrom, date_to: dateTo });
+      const qsEmp = buildQS({
+        date_from: dateFrom,
+        date_to: dateTo,
+        company: companyFilter || undefined,
+      });
 
-    // ---- Tab 1: Hours by employee ----
-    const hoursByEmployee = useFetchRows<HoursByEmployeeRow>(
-        "/payroll/summary/hours_by_employee",
-        {
-            date_from: dateFrom || undefined,
-            date_to: dateTo || undefined,
-            company: company || undefined,
-        }
-    );
-    const hoursByEmployeeCols: GridColDef<HoursByEmployeeRow>[] = [
-        { field: "run_date", headerName: "Run Date", minWidth: 130 },
-        { field: "company", headerName: "Company", minWidth: 160 },
-        { field: "employee_id", headerName: "Employee ID", minWidth: 140 },
-        { field: "name", headerName: "Name", minWidth: 200, flex: 1 },
-        { field: "total_hours", headerName: "Total Hours", minWidth: 140, valueFormatter: (p) => (p.value ?? 0).toFixed(2) },
-    ];
+      // parallel fetches
+      const [pbc, pbe, hbe, com] = await Promise.all([
+        fetchJSON(`/payroll/summary/payout_by_company${qs}`),
+        fetchJSON(`/payroll/summary/payout_by_employee${qsEmp}`),
+        fetchJSON(`/payroll/summary/hours_by_employee${qsEmp}`),
+        fetchJSON(`/payroll/summary/commissions${qs}`),
+      ]);
 
-    // ---- Tab 2: Payout by company ----
-    const payoutByCompany = useFetchRows<PayoutByCompanyRow>(
-        "/payroll/summary/payout_by_company",
-        { date_from: dateFrom || undefined, date_to: dateTo || undefined }
-    );
-    const payoutByCompanyCols: GridColDef<PayoutByCompanyRow>[] = [
-        { field: "run_date", headerName: "Run Date", minWidth: 130 },
-        { field: "company", headerName: "Company", minWidth: 160, flex: 1 },
-        { field: "total_payout", headerName: "Total Payout", minWidth: 160, valueFormatter: (p) => `$${(p.value ?? 0).toFixed(2)}` },
-    ];
+      setPayoutByCompany((pbc?.rows ?? []).map((r: RowAny, i: number) => ({ id: i, ...r })));
+      setPayoutByEmployee((pbe?.rows ?? []).map((r: RowAny, i: number) => ({ id: i, ...r })));
+      setHoursByEmployee((hbe?.rows ?? []).map((r: RowAny, i: number) => ({ id: i, ...r })));
+      setCommissions((com?.rows ?? []).map((r: RowAny, i: number) => ({ id: i, ...r })));
+    } catch (e: any) {
+      console.error(e);
+      setErr(String(e?.message ?? e));
+      setPayoutByCompany([]);
+      setPayoutByEmployee([]);
+      setHoursByEmployee([]);
+      setCommissions([]);
+    } finally {
+      setLoading(false);
+    }
+  }
 
-    // ---- Tab 3: Payout by employee ----
-    const payoutByEmployee = useFetchRows<PayoutByEmployeeRow>(
-        "/payroll/summary/payout_by_employee",
-        {
-            date_from: dateFrom || undefined,
-            date_to: dateTo || undefined,
-            company: company || undefined,
-        }
-    );
-    const payoutByEmployeeCols: GridColDef<PayoutByEmployeeRow>[] = [
-        { field: "run_date", headerName: "Run Date", minWidth: 130 },
-        { field: "company", headerName: "Company", minWidth: 160 },
-        { field: "employee_id", headerName: "Employee ID", minWidth: 140 },
-        { field: "name", headerName: "Name", minWidth: 200, flex: 1 },
-        { field: "total_paid", headerName: "Total Paid", minWidth: 140, valueFormatter: (p) => `$${(p.value ?? 0).toFixed(2)}` },
-    ];
+  // initial load
+  React.useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-    // ---- Tab 4: Commissions ----
-    const commissions = useFetchRows<CommissionRow>(
-        "/payroll/summary/commissions",
-        {
-            date_from: dateFrom || undefined,
-            date_to: dateTo || undefined,
-            beneficiary: beneficiary || undefined,
-        }
-    );
-    const commissionCols: GridColDef<CommissionRow>[] = [
-        { field: "run_date", headerName: "Run Date", minWidth: 130 },
-        { field: "beneficiary", headerName: "Beneficiary", minWidth: 160, flex: 1 },
-        { field: "per_hour_rate", headerName: "$/Hour", minWidth: 120, valueFormatter: (p) => `$${(p.value ?? 0).toFixed(2)}` },
-        { field: "source_hours", headerName: "Hours", minWidth: 120, valueFormatter: (p) => (p.value ?? 0).toFixed(2) },
-        { field: "total_commission", headerName: "Commission", minWidth: 150, valueFormatter: (p) => `$${(p.value ?? 0).toFixed(2)}` },
-    ];
+  // columns
+  const colsPayoutByCompany: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 130, flex: 0.6 },
+    { field: "company", headerName: "Company", minWidth: 160, flex: 0.8 },
+    {
+      field: "total_payout",
+      headerName: "Total Payout",
+      minWidth: 160,
+      flex: 0.8,
+      valueFormatter: (p) =>
+        p.value == null ? "" : `$${Number(p.value).toFixed(2)}`,
+    },
+  ];
 
-    // --- derive company list for the filter (from hoursByCompany result) ---
-    const companyOptions = React.useMemo(() => {
-        const s = new Set<string>();
-        hoursByCompany.rows.forEach(r => r.company && s.add(String(r.company)));
-        hoursByEmployee.rows.forEach(r => r.company && s.add(String(r.company)));
-        payoutByCompany.rows.forEach(r => r.company && s.add(String(r.company)));
-        payoutByEmployee.rows.forEach(r => r.company && s.add(String(r.company)));
-        return ["", ...Array.from(s).sort()];
-    }, [hoursByCompany.rows, hoursByEmployee.rows, payoutByCompany.rows, payoutByEmployee.rows]);
+  const colsPayoutByEmployee: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 130, flex: 0.6 },
+    { field: "company", headerName: "Company", minWidth: 140, flex: 0.7 },
+    { field: "employee_id", headerName: "Emp ID", minWidth: 120, flex: 0.6 },
+    { field: "name", headerName: "Name", minWidth: 200, flex: 1.1 },
+    {
+      field: "total_paid",
+      headerName: "Total Paid",
+      minWidth: 140,
+      flex: 0.7,
+      valueFormatter: (p) =>
+        p.value == null ? "" : `$${Number(p.value).toFixed(2)}`,
+    },
+  ];
 
-    // --- Active table config based on tab ---
-    const current = [
-        {
-            title: "Hours by Company",
-            data: hoursByCompany.rows,
-            loading: hoursByCompany.loading,
-            refetch: hoursByCompany.refetch,
-            columns: hoursByCompanyCols,
-            exportName: "Hours by Company",
-            getRowId: (r: HoursByCompanyRow, i: number) => `${r.run_date}-${r.company ?? "(none)"}-${i}`,
-        },
-        {
-            title: "Hours by Employee",
-            data: hoursByEmployee.rows,
-            loading: hoursByEmployee.loading,
-            refetch: hoursByEmployee.refetch,
-            columns: hoursByEmployeeCols,
-            exportName: "Hours by Employee",
-            getRowId: (r: HoursByEmployeeRow) => `${r.run_date}-${r.employee_id}`,
-        },
-        {
-            title: "Payout by Company",
-            data: payoutByCompany.rows,
-            loading: payoutByCompany.loading,
-            refetch: payoutByCompany.refetch,
-            columns: payoutByCompanyCols,
-            exportName: "Payout by Company",
-            getRowId: (r: PayoutByCompanyRow, i: number) => `${r.run_date}-${r.company ?? "(none)"}-${i}`,
-        },
-        {
-            title: "Payout by Employee",
-            data: payoutByEmployee.rows,
-            loading: payoutByEmployee.loading,
-            refetch: payoutByEmployee.refetch,
-            columns: payoutByEmployeeCols,
-            exportName: "Payout by Employee",
-            getRowId: (r: PayoutByEmployeeRow) => `${r.run_date}-${r.employee_id}`,
-        },
-        {
-            title: "Commissions",
-            data: commissions.rows,
-            loading: commissions.loading,
-            refetch: commissions.refetch,
-            columns: commissionCols,
-            exportName: "Commissions",
-            getRowId: (r: CommissionRow, i: number) => `${r.run_date}-${r.beneficiary}-${i}`,
-        },
-    ][tab];
+  const colsHoursByEmployee: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 130, flex: 0.6 },
+    { field: "company", headerName: "Company", minWidth: 140, flex: 0.7 },
+    { field: "employee_id", headerName: "Emp ID", minWidth: 120, flex: 0.6 },
+    { field: "name", headerName: "Name", minWidth: 200, flex: 1.1 },
+    {
+      field: "total_hours",
+      headerName: "Total Hours",
+      minWidth: 140,
+      flex: 0.7,
+      valueFormatter: (p) =>
+        p.value == null ? "" : Number(p.value).toFixed(2),
+    },
+  ];
 
-    const handleExport = () => exportSheet(current.exportName, current.data);
+  const colsCommissions: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 130, flex: 0.6 },
+    { field: "beneficiary", headerName: "Beneficiary", minWidth: 160, flex: 0.8 },
+    {
+      field: "per_hour_rate",
+      headerName: "Per-Hour Rate",
+      minWidth: 150,
+      flex: 0.7,
+      valueFormatter: (p) =>
+        p.value == null ? "" : `$${Number(p.value).toFixed(2)}`,
+    },
+    {
+      field: "source_hours",
+      headerName: "Source Hours",
+      minWidth: 150,
+      flex: 0.7,
+      valueFormatter: (p) =>
+        p.value == null ? "" : Number(p.value).toFixed(2),
+    },
+    {
+      field: "total_commission",
+      headerName: "Total Commission",
+      minWidth: 170,
+      flex: 0.8,
+      valueFormatter: (p) =>
+        p.value == null ? "" : `$${Number(p.value).toFixed(2)}`,
+    },
+  ];
 
-    const handleRefresh = () => current.refetch();
+  return (
+    <Stack gap={2}>
+      <Typography variant="h5" sx={{ fontWeight: 700 }}>
+        Reports
+      </Typography>
 
-    return (
-        <Stack gap={2}>
-            <Typography variant="h5" fontWeight={700}>Reports</Typography>
+      {/* Filters */}
+      <Stack
+        direction={{ xs: "column", sm: "row" }}
+        gap={2}
+        alignItems={{ xs: "stretch", sm: "center" }}
+      >
+        <TextField
+          label="From (UTC)"
+          type="date"
+          size="small"
+          value={dateFrom}
+          onChange={(e) => setDateFrom(e.target.value)}
+          InputLabelProps={{ shrink: true }}
+        />
+        <TextField
+          label="To (UTC)"
+          type="date"
+          size="small"
+          value={dateTo}
+          onChange={(e) => setDateTo(e.target.value)}
+          InputLabelProps={{ shrink: true }}
+        />
+        <TextField
+          label="Company (optional)"
+          select
+          size="small"
+          value={companyFilter}
+          onChange={(e) => setCompanyFilter(e.target.value)}
+          sx={{ minWidth: 220 }}
+        >
+          <MenuItem value="">All Companies</MenuItem>
+          {companies.map((c) => (
+            <MenuItem key={c} value={c}>
+              {c}
+            </MenuItem>
+          ))}
+        </TextField>
+        <Button variant="contained" onClick={load}>
+          Reload
+        </Button>
+      </Stack>
 
-            {/* Filters toolbar */}
-            <Box
-                sx={{
-                    p: 2,
-                    background: "#fff",
-                    border: "1px solid #e5e7eb",
-                    borderRadius: 2,
-                    display: "grid",
-                    gridTemplateColumns: { xs: "1fr", sm: "repeat(5, 1fr)" },
-                    gap: 2,
-                    alignItems: "center",
-                }}
-            >
-                <TextField
-                    label="Date From (UTC)"
-                    type="date"
-                    value={dateFrom}
-                    onChange={(e) => setDateFrom(e.target.value)}
-                    size="small"
-                    InputLabelProps={{ shrink: true }}
-                />
-                <TextField
-                    label="Date To (UTC)"
-                    type="date"
-                    value={dateTo}
-                    onChange={(e) => setDateTo(e.target.value)}
-                    size="small"
-                    InputLabelProps={{ shrink: true }}
-                />
+      {err && <Alert severity="error">{err}</Alert>}
 
-                {/* Company filter (used by employee-based tabs; harmless on others) */}
-                <FormControl size="small">
-                    <InputLabel>Company (opt)</InputLabel>
-                    <Select
-                        label="Company (opt)"
-                        value={company}
-                        onChange={(e) => setCompany(e.target.value)}
-                    >
-                        {companyOptions.map((c) => (
-                            <MenuItem key={c || "(any)"} value={c}>
-                                {c || "(any)"}
-                            </MenuItem>
-                        ))}
-                    </Select>
-                </FormControl>
+      {/* Layout: 2x2 grids, responsive */}
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", lg: "1fr 1fr" },
+          gap: 2,
+        }}
+      >
+        <Box sx={{ height: 420, width: "100%" }}>
+          <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 600 }}>
+            Payout by Company
+          </Typography>
+          <DataGrid
+            rows={payoutByCompany}
+            columns={colsPayoutByCompany}
+            loading={loading}
+            disableRowSelectionOnClick
+            initialState={{
+              sorting: { sortModel: [{ field: "run_date", sort: "desc" }] },
+              pagination: { paginationModel: { pageSize: 25, page: 0 } },
+            }}
+            pageSizeOptions={[10, 25, 50]}
+          />
+        </Box>
 
-                {/* Beneficiary for commissions */}
-                <TextField
-                    label="Beneficiary (opt)"
-                    placeholder="danny"
-                    value={beneficiary}
-                    onChange={(e) => setBeneficiary(e.target.value)}
-                    size="small"
-                />
+        <Box sx={{ height: 420, width: "100%" }}>
+          <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 600 }}>
+            Payout by Employee{companyFilter ? ` — ${companyFilter}` : ""}
+          </Typography>
+          <DataGrid
+            rows={payoutByEmployee}
+            columns={colsPayoutByEmployee}
+            loading={loading}
+            disableRowSelectionOnClick
+            initialState={{
+              sorting: { sortModel: [{ field: "run_date", sort: "desc" }] },
+              pagination: { paginationModel: { pageSize: 25, page: 0 } },
+            }}
+            pageSizeOptions={[10, 25, 50]}
+          />
+        </Box>
 
-                <Stack direction="row" gap={1}>
-                    <Button
-                        onClick={handleRefresh}
-                        startIcon={<RefreshIcon />}
-                        variant="outlined"
-                    >
-                        Refresh
-                    </Button>
-                    <Button
-                        onClick={handleExport}
-                        startIcon={<DownloadIcon />}
-                        variant="contained"
-                    >
-                        Export
-                    </Button>
-                </Stack>
-            </Box>
+        <Box sx={{ height: 420, width: "100%" }}>
+          <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 600 }}>
+            Hours by Employee{companyFilter ? ` — ${companyFilter}` : ""}
+          </Typography>
+          <DataGrid
+            rows={hoursByEmployee}
+            columns={colsHoursByEmployee}
+            loading={loading}
+            disableRowSelectionOnClick
+            initialState={{
+              sorting: { sortModel: [{ field: "run_date", sort: "desc" }] },
+              pagination: { paginationModel: { pageSize: 25, page: 0 } },
+            }}
+            pageSizeOptions={[10, 25, 50]}
+          />
+        </Box>
 
-            {/* Tabs */}
-            <Box sx={{ borderBottom: 1, borderColor: "divider" }}>
-                <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" allowScrollButtonsMobile>
-                    <Tab label="Hours by Company" />
-                    <Tab label="Hours by Employee" />
-                    <Tab label="Payout by Company" />
-                    <Tab label="Payout by Employee" />
-                    <Tab label="Commissions" />
-                </Tabs>
-            </Box>
-
-            {/* Table */}
-            <Box sx={{ width: "100%", bgcolor: "background.paper", borderRadius: 2 }}>
-                <DataGrid
-                    rows={current.data}
-                    columns={current.columns as GridColDef[]}
-                    getRowId={current.getRowId as any}
-                    loading={current.loading}
-                    disableRowSelectionOnClick
-                    autoHeight
-                    initialState={{
-                        pagination: { paginationModel: { pageSize: 25, page: 0 } },
-                        sorting: { sortModel: [{ field: "run_date", sort: "desc" }] },
-                    }}
-                    pageSizeOptions={[10, 25, 50, 100]}
-                    sx={{
-                        borderRadius: 2,
-                        "& .MuiDataGrid-columnHeaders": { background: "#f3f4f6", fontWeight: 600 },
-                    }}
-                />
-            </Box>
-        </Stack>
-    );
+        <Box sx={{ height: 420, width: "100%" }}>
+          <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 600 }}>
+            Commissions
+          </Typography>
+          <DataGrid
+            rows={commissions}
+            columns={colsCommissions}
+            loading={loading}
+            disableRowSelectionOnClick
+            initialState={{
+              sorting: { sortModel: [{ field: "run_date", sort: "desc" }] },
+              pagination: { paginationModel: { pageSize: 25, page: 0 } },
+            }}
+            pageSizeOptions={[10, 25, 50]}
+          />
+        </Box>
+      </Box>
+    </Stack>
+  );
 }
