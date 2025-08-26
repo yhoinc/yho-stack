@@ -2,66 +2,42 @@ import os
 import sqlite3
 import uuid
 import datetime
-from typing import Any, Dict, List, Optional
 import pathlib
-import shutil
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, Body, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-# =========================================================
-# Config: DB path resolution (local & Fly volume-friendly)
-# =========================================================
+# --- R2 (Cloudflare S3 API) ---
+import boto3
+from botocore.client import Config
+from urllib.parse import quote_plus
 
+# ----------------- Config -----------------
 BASE_DIR = pathlib.Path(__file__).resolve().parent
+DB_PATH = os.environ.get("DB_PATH", "employees_with_company_v2.db")
 
-# Default DB file name (alongside this file in local dev)
-DEFAULT_DB_FILENAME = "employees_with_company_v2.db"
-
-# Allow override via env; if relative, resolve next to main.py
-DB_PATH = os.environ.get("DB_PATH", DEFAULT_DB_FILENAME)
+# Make relative paths resolve next to main.py
 if not os.path.isabs(DB_PATH):
     DB_PATH = str(BASE_DIR / DB_PATH)
 
-# Fly volume mount directory (when provided)
-DATA_DIR = os.environ.get("DATA_DIR")
-
-# If a DATA_DIR is set (e.g. /data on Fly), seed the DB there once and use it
-if DATA_DIR:
-    target = pathlib.Path(DATA_DIR) / pathlib.Path(DB_PATH).name
-    if not target.exists():
-        seed = pathlib.Path(DB_PATH) if os.path.exists(DB_PATH) else (BASE_DIR / DEFAULT_DB_FILENAME)
-        if seed.exists():
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(seed, target)
-            print(f"[startup] Seeded DB to volume: {target}")
-    DB_PATH = str(target)
+DATA_DIR = os.environ.get("DATA_DIR", str(BASE_DIR))
+os.makedirs(DATA_DIR, exist_ok=True)
 
 print(f"[startup] Using DB: {DB_PATH}")
 
-# =========================================================
-# App & CORS
-# =========================================================
-
+# ----------------- App --------------------
 app = FastAPI(title="YHO API")
-
-# ALLOWED_ORIGINS can be a comma-separated list, e.g.
-# "http://localhost:3000,https://your-web.vercel.app"
-allowed_origins_env = os.environ.get("ALLOWED_ORIGINS", "*")
-allowed_origins = [o.strip() for o in allowed_origins_env.split(",")] if allowed_origins_env else ["*"]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # tighten in prod (e.g., your Render frontend origin)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================================================
-# DB helpers
-# =========================================================
-
+# ----------------- DB helpers -------------
 def connect():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -72,10 +48,7 @@ def execmany(con: sqlite3.Connection, sql: str, rows: List[tuple]):
     cur.executemany(sql, rows)
     cur.close()
 
-# =========================================================
-# Schema ensure (append-only payroll tables)
-# =========================================================
-
+# ----------------- Schema Ensure -------------
 PAYROLL_SCHEMA = """
 create table if not exists payroll_runs (
   id              integer primary key autoincrement,
@@ -114,19 +87,35 @@ create index if not exists idx_commissions_run on commissions(run_id);
 create index if not exists idx_payroll_runs_ts on payroll_runs(run_ts_utc);
 """
 
+# Documents table (for R2 files)
+DOCS_SCHEMA = """
+create table if not exists documents (
+  id            integer primary key autoincrement,
+  employee_id   text,
+  employee_name text,
+  doc_types     text,              -- comma separated tags (e.g., "tax,id")
+  object_key    text not null,     -- R2 object key
+  content_type  text,
+  size          integer,
+  uploaded_at   text not null,
+  uploader_ref  text               -- optional (who uploaded)
+);
+create index if not exists idx_docs_key on documents(object_key);
+create index if not exists idx_docs_name on documents(employee_name);
+create index if not exists idx_docs_types on documents(doc_types);
+"""
+
 @app.on_event("startup")
 def ensure_schema():
     con = connect()
     try:
         con.executescript(PAYROLL_SCHEMA)
+        con.executescript(DOCS_SCHEMA)
         con.commit()
     finally:
         con.close()
 
-# =========================================================
-# Employees
-# =========================================================
-
+# ----------------- Employees (existing) -----------------
 @app.get("/employees")
 def list_employees(limit: int = 100, offset: int = 0):
     con = connect()
@@ -187,10 +176,7 @@ def patch_employee(employee_id: str, payload: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
-# =========================================================
-# Payroll: create run (append-only)
-# =========================================================
-
+# ----------------- Payroll: create run (append-only) -----------------
 @app.post("/payroll/runs")
 def create_payroll_run(payload: Dict[str, Any] = Body(...)):
     """
@@ -218,7 +204,7 @@ def create_payroll_run(payload: Dict[str, Any] = Body(...)):
     run_ts_utc = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
     run_key = f"{run_ts_utc}-{uuid.uuid4().hex[:8]}"
 
-    prepared: List[tuple] = []
+    prepared = []
     total_hours_sum = 0.0
     for it in items:
         w1 = float(it.get("week1_hours") or 0)
@@ -277,10 +263,7 @@ def create_payroll_run(payload: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
-# =========================================================
-# Summaries
-# =========================================================
-
+# ----------------- Summaries -----------------
 @app.get("/payroll/summary/hours_by_company")
 def hours_by_company(date_from: Optional[str] = None, date_to: Optional[str] = None):
     con = connect()
@@ -299,7 +282,7 @@ def hours_by_company(date_from: Optional[str] = None, date_to: Optional[str] = N
         if date_to:
             q += " and pr.run_ts_utc <= ?"; params.append(date_to)
         q += " group by pr.company, date(pr.run_ts_utc) order by run_date desc, company"
-        rows = [dict(r) for r in con.execute(q, params)]
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -324,7 +307,7 @@ def hours_by_employee(date_from: Optional[str] = None, date_to: Optional[str] = 
             q += " and pr.company = ?"; params.append(company)
         q += " group by pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc)"
         q += " order by run_date desc, company, pi.name"
-        rows = [dict(r) for r in con.execute(q, params)]
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -346,7 +329,7 @@ def payout_by_company(date_from: Optional[str] = None, date_to: Optional[str] = 
         if date_to:
             q += " and pr.run_ts_utc <= ?"; params.append(date_to)
         q += " group by pr.company, date(pr.run_ts_utc) order by run_date desc, company"
-        rows = [dict(r) for r in con.execute(q, params)]
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -371,7 +354,7 @@ def payout_by_employee(date_from: Optional[str] = None, date_to: Optional[str] =
             q += " and pr.company = ?"; params.append(company)
         q += " group by pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc)"
         q += " order by run_date desc, company, pi.name"
-        rows = [dict(r) for r in con.execute(q, params)]
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -395,37 +378,224 @@ def commissions_summary(date_from: Optional[str] = None, date_to: Optional[str] 
         if beneficiary:
             q += " and c.beneficiary = ?"; params.append(beneficiary)
         q += " order by run_date desc"
-        rows = [dict(r) for r in con.execute(q, params)]
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
 
-# =========================================================
-# Debug endpoints (handy during deploy)
-# =========================================================
+# ----------------- R2 client + helpers -----------------
+def r2_client():
+    """
+    Cloudflare R2 S3-compatible client using env vars:
+      - R2_BUCKET_ENDPOINT
+      - R2_ACCESS_KEY_ID
+      - R2_SECRET_ACCESS_KEY
+    """
+    endpoint = os.environ["R2_BUCKET_ENDPOINT"]
+    access_key = os.environ["R2_ACCESS_KEY_ID"]
+    secret_key = os.environ["R2_SECRET_ACCESS_KEY"]
+    return boto3.client(
+        "s3",
+        region_name="auto",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=Config(signature_version="s3v4"),
+    )
 
-@app.get("/debug/health")
-def debug_health():
-    return {"status": "ok", "db_path": DB_PATH, "allowed_origins": allowed_origins}
+def safe_key_segment(s: str) -> str:
+    # minimal cleaner for employee names / tags -> path-safe
+    return "-".join("".join(ch for ch in (s or "").strip() if ch.isalnum() or ch in (" ", "_", "-")).split())
 
-@app.get("/debug/tables")
-def debug_tables():
+@app.get("/r2/ping")
+def r2_ping():
+    bucket = os.environ["R2_BUCKET"]
+    s3 = r2_client()
+    try:
+        s3.head_bucket(Bucket=bucket)
+        return {"ok": True, "bucket": bucket}
+    except Exception as e:
+        return {"ok": False, "bucket": bucket, "error": str(e)}
+
+# ----------------- Documents: Upload (pre-signed), Save, Search, Download, Delete -----------------
+@app.post("/documents/presign-upload")
+def presign_upload(
+    employee_name: str = Body(..., embed=True),
+    employee_id: Optional[str] = Body(None, embed=True),
+    doc_types: Optional[List[str]] = Body(default=None, embed=True),  # e.g. ["tax","id"]
+    filename: str = Body(..., embed=True),
+    content_type: Optional[str] = Body(None, embed=True),
+):
+    """
+    Returns a pre-signed PUT URL so the client can upload directly to R2.
+    After a successful upload, call /documents/save to record metadata.
+    """
+    bucket = os.environ["R2_BUCKET"]
+    s3 = r2_client()
+
+    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    name_seg = safe_key_segment(employee_name) or "unknown"
+    types_seg = safe_key_segment("-".join(doc_types or [])) if doc_types else "doc"
+    orig_seg = safe_key_segment(filename)
+    key = f"employees/{name_seg}/{ts}_{types_seg}_{orig_seg}"
+
+    # Pre-sign PUT (client will send the file bytes directly)
+    params = {
+        "Bucket": bucket,
+        "Key": key,
+    }
+    if content_type:
+        params["ContentType"] = content_type
+
+    url = s3.generate_presigned_url(
+        "put_object",
+        Params=params,
+        ExpiresIn=60 * 10,  # 10 minutes
+        HttpMethod="PUT",
+    )
+
+    return {
+        "key": key,
+        "upload_url": url,
+        "headers": {"Content-Type": content_type} if content_type else {},
+    }
+
+@app.post("/documents/save")
+def save_document_record(payload: Dict[str, Any] = Body(...)):
+    """
+    Client calls this after a successful pre-signed upload.
+    payload = {
+      "key": "...",                 (required)
+      "employee_name": "...",       (required)
+      "employee_id": "...",         (optional)
+      "doc_types": ["tax","id"],    (optional)
+      "size": 12345,                (optional)
+      "content_type": "application/pdf" (optional)
+    }
+    """
+    key = payload.get("key")
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    employee_name = payload.get("employee_name") or ""
+    employee_id = payload.get("employee_id")
+    doc_types = payload.get("doc_types") or []
+    doc_types_csv = ",".join([t.strip() for t in doc_types if t and isinstance(t, str)])
+    size = int(payload.get("size") or 0)
+    content_type = payload.get("content_type")
+
+    uploaded_at = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
     con = connect()
     try:
-        rows = [dict(r) for r in con.execute(
-            "select name, sql from sqlite_master where type='table' order by name"
-        )]
-        return {"tables": rows}
+        cur = con.cursor()
+        cur.execute(
+            """insert into documents (employee_id, employee_name, doc_types, object_key, content_type, size, uploaded_at)
+               values (?,?,?,?,?,?,?)""",
+            (employee_id, employee_name, doc_types_csv, key, content_type, size, uploaded_at),
+        )
+        doc_id = cur.lastrowid
+        con.commit()
+        return {"ok": True, "id": doc_id}
     finally:
         con.close()
 
-@app.get("/debug/employees_count")
-def debug_employees_count():
+@app.get("/documents/search")
+def search_documents(
+    q: Optional[str] = Query(None, description="free text in name/types/key"),
+    employee: Optional[str] = Query(None, description="exact employee_name filter"),
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    Basic search across employee_name, doc_types, object_key.
+    """
+    clauses = []
+    params: List[Any] = []
+    if q:
+        like = f"%{q}%"
+        clauses.append("(employee_name like ? or doc_types like ? or object_key like ?)")
+        params.extend([like, like, like])
+    if employee:
+        clauses.append("employee_name = ?")
+        params.append(employee)
+
+    where = "where " + " and ".join(clauses) if clauses else ""
+    sql = f"""
+      select id, employee_id, employee_name, doc_types, object_key, content_type, size, uploaded_at
+      from documents
+      {where}
+      order by uploaded_at desc
+      limit ? offset ?
+    """
+    params.extend([limit, offset])
+
     con = connect()
     try:
-        row = con.execute("select count(*) as c from employees").fetchone()
-        return {"employees_count": (row["c"] if row else 0)}
+        rows = [dict(r) for r in con.execute(sql, params)]
+        return {"rows": rows}
+    finally:
+        con.close()
+
+@app.get("/documents/{doc_id}/download")
+def document_download(doc_id: int):
+    """
+    Returns a pre-signed GET URL to download/view the file.
+    """
+    con = connect()
+    try:
+        row = con.execute("select object_key, content_type from documents where id = ?", (doc_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        key = row["object_key"]
+        ctype = row["content_type"]
+    finally:
+        con.close()
+
+    bucket = os.environ["R2_BUCKET"]
+    s3 = r2_client()
+
+    params = {"Bucket": bucket, "Key": key}
+    if ctype:
+        params["ResponseContentType"] = ctype
+
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params=params,
+        ExpiresIn=60 * 10,  # 10 minutes
+        HttpMethod="GET",
+    )
+    return {"url": url}
+
+@app.delete("/documents/{doc_id}")
+def delete_document(doc_id: int):
+    """
+    Deletes the record and the object in R2.
+    """
+    # first load key
+    con = connect()
+    try:
+        row = con.execute("select object_key from documents where id = ?", (doc_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found")
+        key = row["object_key"]
+    finally:
+        con.close()
+
+    # delete from R2
+    bucket = os.environ["R2_BUCKET"]
+    s3 = r2_client()
+    try:
+        s3.delete_object(Bucket=bucket, Key=key)
     except Exception as e:
-        return {"error": str(e)}
+        # don't fail hard; still attempt to remove record
+        print("[warn] r2 delete_object failed:", e)
+
+    # delete record
+    con = connect()
+    try:
+        con.execute("delete from documents where id = ?", (doc_id,))
+        con.commit()
+        return {"ok": True}
     finally:
         con.close()
