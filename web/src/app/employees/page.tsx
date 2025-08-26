@@ -1,193 +1,282 @@
 "use client";
-
 import * as React from "react";
 import {
-  DataGrid,
-  GridColDef,
-  GridRowModes,
-  GridRowModesModel,
-  GridActionsCellItem,
-  GridRowModel,
-} from "@mui/x-data-grid";
-import { Box } from "@mui/material";
+    Box,
+    Button,
+    Dialog,
+    DialogActions,
+    DialogContent,
+    DialogTitle,
+    IconButton,
+    Stack,
+    TextField,
+    Typography,
+} from "@mui/material";
+import { DataGrid, GridColDef, GridToolbar } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
-import SaveIcon from "@mui/icons-material/Save";
-import CloseIcon from "@mui/icons-material/Close";
+import AddIcon from "@mui/icons-material/Add";
 
 type Employee = {
-  id: string; // DataGrid key (from employee_id)
-  employee_id: string;
-  name: string | null;
-  company: string | null;
-  location: string | null;
-  reference: string | null;
-  position: string | null;
-  labor_rate: number | null;
-  per_diem: number | null;
-  phone: string | null;
+    employee_id: string;
+    reference?: string | null;
+    company?: string | null;
+    location?: string | null;
+    name?: string | null;
+    phone?: string | null;
+    address?: string | null;
+    position?: string | null;
+    labor_rate?: number | string | null;
+    per_diem?: number | string | null;
+    deduction?: string | null;
+    debt?: string | null;
+    payment_count?: string | null;
+    apartment_id?: string | null;
 };
 
-type EmployeesResponse = { rows: Omit<Employee, "id">[] };
-
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE as string | undefined) ?? "/api";
-
 export default function EmployeesPage() {
-  const [rows, setRows] = React.useState<Employee[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [rowModesModel, setRowModesModel] = React.useState<GridRowModesModel>({});
+    const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+    const [rows, setRows] = React.useState<Employee[]>([]);
+    const [loading, setLoading] = React.useState(false);
 
-  // ---- load data ----
-  React.useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
+    const [open, setOpen] = React.useState(false);
+    const [mode, setMode] = React.useState<"create" | "edit">("create");
+    const [form, setForm] = React.useState<Partial<Employee>>({});
+    const [saving, setSaving] = React.useState(false);
+    const [error, setError] = React.useState<string | null>(null);
+
+    const fetchRows = React.useCallback(async () => {
         setLoading(true);
-        const res = await fetch(`${API_BASE}/employees?limit=2000`, { cache: "no-store" });
-        const data: EmployeesResponse = await res.json();
-        if (cancelled) return;
-        const mapped: Employee[] = (data?.rows ?? []).map((r, i) => ({
-          id: r.employee_id ?? String(i),
-          ...r,
-        })) as Employee[];
-        setRows(mapped);
-      } catch (err) {
-        console.error("employees fetch failed:", err);
-        if (!cancelled) setRows([]);
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
+        try {
+            const r = await fetch(`${API}/employees?limit=1000`);
+            const d = await r.json();
+            const raw: any[] = d?.rows ?? [];
+            setRows(raw); // trust backend values
+        } finally {
+            setLoading(false);
+        }
+    }, [API]);
+
+    React.useEffect(() => {
+        fetchRows();
+    }, [fetchRows]);
+
+    const moneyFmt = (p: any) => {
+        const v = p?.value;
+        return v == null || v === "" || Number.isNaN(Number(v))
+            ? "-"
+            : `$${Number(v).toFixed(2)}`;
     };
-  }, []);
+    const numFmt = (p: any) => {
+        const v = p?.value;
+        return v == null || v === "" || Number.isNaN(Number(v))
+            ? "-"
+            : Number(v).toFixed(2);
+    };
 
-  // ---- editing helpers ----
-  const handleEditClick = (id: string) => () => {
-    setRowModesModel((prev) => ({ ...prev, [id]: { mode: GridRowModes.Edit } }));
-  };
-  const handleSaveClick = (id: string) => () => {
-    setRowModesModel((prev) => ({ ...prev, [id]: { mode: GridRowModes.View } }));
-  };
-  const handleCancelClick = (id: string) => () => {
-    setRowModesModel((prev) => ({
-      ...prev,
-      [id]: { mode: GridRowModes.View, ignoreModifications: true },
-    }));
-  };
-
-  async function processRowUpdate(newRow: GridRowModel, oldRow: GridRowModel) {
-    // Only send changed editable fields
-    const editable: (keyof Employee)[] = [
-      "name",
-      "company",
-      "location",
-      "reference",
-      "position",
-      "labor_rate",
-      "per_diem",
-      "phone",
+    const columns: GridColDef[] = [
+        { field: "employee_id", headerName: "ID", minWidth: 120 },
+        { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
+        { field: "reference", headerName: "Ref", minWidth: 110 },
+        { field: "company", headerName: "Company", minWidth: 140 },
+        { field: "location", headerName: "Location", minWidth: 120 },
+        { field: "position", headerName: "Position", minWidth: 140 },
+        { field: "phone", headerName: "Phone", minWidth: 150 },
+        { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
+        {
+            field: "labor_rate",
+            headerName: "Labor Rate",
+            minWidth: 130,
+            sortable: true,
+            renderCell: (params) => {
+                const v = params.row?.labor_rate ?? params.row?.pay_rate ?? null;
+                if (v == null || v === "" || Number.isNaN(Number(v))) return "-";
+                return `$${Number(v).toFixed(2)}`;
+            },
+        },
+        {
+            field: "actions",
+            headerName: "Actions",
+            sortable: false,
+            filterable: false,
+            width: 100,
+            renderCell: (params) => (
+                <IconButton size="small" onClick={() => openEdit(params.row as Employee)} aria-label="edit">
+                    <EditIcon fontSize="small" />
+                </IconButton>
+            ),
+        },
     ];
-    const patch: Record<string, unknown> = {};
-    for (const k of editable) {
-      if (newRow[k] !== oldRow[k]) patch[k] = newRow[k];
+
+    function openCreate() {
+        setMode("create");
+        setForm({
+            employee_id: "",
+            name: "",
+            reference: "",
+            company: "",
+            location: "",
+            position: "",
+            phone: "",
+            per_diem: "",
+            labor_rate: "",
+        });
+        setError(null);
+        setOpen(true);
     }
-    if (Object.keys(patch).length === 0) return newRow;
 
-    try {
-      const employee_id = String(newRow.employee_id ?? oldRow.employee_id);
-      const res = await fetch(`${API_BASE}/employees/${encodeURIComponent(employee_id)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(patch),
-      });
-      if (!res.ok) throw new Error(`PATCH failed: ${res.status}`);
-      // optimistic local update
-      setRows((prev) => prev.map((r) => (r.id === newRow.id ? { ...(newRow as Employee) } : r)));
-      return newRow;
-    } catch (e) {
-      console.error("save failed, reverting", e);
-      return oldRow; // revert if API fails
+    function openEdit(emp: Employee) {
+        setMode("edit");
+        setForm({ ...emp });
+        setError(null);
+        setOpen(true);
     }
-  }
 
-  // ---- columns ----
-  const currencyFmt = (v: unknown) =>
-    v === null || v === undefined || v === "" ? "" : `$${Number(v).toFixed(2)}`;
+    async function save() {
+        setSaving(true);
+        try {
+            const payload: any = { ...form };
+            // coerce numerics if provided
+            payload.labor_rate =
+                payload.labor_rate === "" || payload.labor_rate == null
+                    ? null
+                    : Number(payload.labor_rate);
+            payload.per_diem =
+                payload.per_diem === "" || payload.per_diem == null
+                    ? null
+                    : Number(payload.per_diem);
 
-  const columns: GridColDef[] = [
-    { field: "employee_id", headerName: "ID", minWidth: 120, flex: 0.6 },
-    { field: "name", headerName: "Name", minWidth: 200, flex: 1.4, editable: true },
-    { field: "company", headerName: "Company", minWidth: 140, flex: 0.9, editable: true },
-    { field: "location", headerName: "Location", minWidth: 120, flex: 0.8, editable: true },
-    { field: "reference", headerName: "Reference", minWidth: 120, flex: 0.8, editable: true },
-    {
-      field: "labor_rate",
-      headerName: "Labor Rate",
-      type: "number",
-      minWidth: 120,
-      flex: 0.8,
-      editable: true,
-      valueFormatter: (p) => currencyFmt(p.value),
-    },
-    {
-      field: "per_diem",
-      headerName: "Per Diem",
-      type: "number",
-      minWidth: 110,
-      flex: 0.7,
-      editable: true,
-      valueFormatter: (p) => currencyFmt(p.value),
-    },
-    { field: "position", headerName: "Position", minWidth: 140, flex: 1, editable: true },
-    { field: "phone", headerName: "Phone", minWidth: 140, flex: 0.9, editable: true },
-    {
-      field: "actions",
-      type: "actions",
-      headerName: "Actions",
-      minWidth: 120,
-      getActions: (params) => {
-        const id = String(params.id);
-        const isEditing = rowModesModel[id]?.mode === GridRowModes.Edit;
-        return isEditing
-          ? [
-              <GridActionsCellItem key="save" icon={<SaveIcon />} label="Save" onClick={handleSaveClick(id)} />,
-              <GridActionsCellItem key="cancel" icon={<CloseIcon />} label="Cancel" onClick={handleCancelClick(id)} />,
-            ]
-          : [<GridActionsCellItem key="edit" icon={<EditIcon />} label="Edit" onClick={handleEditClick(id)} />];
-      },
-    },
-  ];
+            if (mode === "create") {
+                if (!payload.employee_id || !payload.name) {
+                    setError("Employee ID and Name are required");
+                    setSaving(false);
+                    return;
+                }
+                const res = await fetch(`${API}/employees`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                });
+                if (!res.ok) throw new Error(await res.text());
+            } else {
+                const id = payload.employee_id;
+                const { employee_id, ...rest } = payload;
+                const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
+                    method: "PATCH",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(rest),
+                });
+                if (!res.ok) throw new Error(await res.text());
+            }
+            setOpen(false);
+            await fetchRows();
+        } catch (e: any) {
+            setError(e?.message || "Save failed");
+        } finally {
+            setSaving(false);
+        }
+    }
 
-  // ---- render ----
-  return (
-    <Box
-      sx={{
-        height: "calc(100vh - 110px)", // adjust if your header height changes
-        width: "100%",
-        minWidth: 0,
-      }}
-    >
-      <DataGrid
-        rows={rows}
-        columns={columns}
-        loading={loading}
-        disableRowSelectionOnClick
-        editMode="row"
-        rowModesModel={rowModesModel}
-        onRowModesModelChange={setRowModesModel}
-        processRowUpdate={processRowUpdate}
-        experimentalFeatures={{ newEditingApi: true }}
-        initialState={{
-          pagination: { paginationModel: { pageSize: 25, page: 0 } },
-          sorting: { sortModel: [{ field: "name", sort: "asc" }] },
-        }}
-        pageSizeOptions={[10, 25, 50, 100]}
-        sx={{
-          "& .MuiDataGrid-columnHeaders": { position: "sticky", top: 0, zIndex: 1 },
-          ".MuiDataGrid-main": { width: "100%" },
-        }}
-      />
-    </Box>
-  );
+    return (
+        <Stack gap={2}>
+            <Stack direction="row" alignItems="center" justifyContent="space-between">
+                <Typography variant="h5" fontWeight={600}>
+                    Employees
+                </Typography>
+                <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+                    Add Employee
+                </Button>
+            </Stack>
+
+            <Box sx={{ height: 640, width: "100%", bgcolor: "background.paper", borderRadius: 2, p: 1 }}>
+                <DataGrid
+                    rows={rows}
+                    columns={columns}
+                    getRowId={(r) => r.employee_id}
+                    loading={loading}
+                    disableRowSelectionOnClick
+                    slots={{ toolbar: GridToolbar }}
+                    initialState={{
+                        pagination: { paginationModel: { pageSize: 25, page: 0 } },
+                        sorting: { sortModel: [{ field: "name", sort: "asc" }] },
+                    }}
+                    pageSizeOptions={[10, 25, 50, 100]}
+                />
+            </Box>
+
+            <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
+                <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
+                <DialogContent dividers>
+                    {/* simple 2-column responsive form without MUI Grid to avoid TS issues */}
+                    <Box
+                        sx={{
+                            display: "grid",
+                            gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
+                            gap: 2,
+                            mt: 0,
+                        }}
+                    >
+                        <TextField
+                            label="Employee ID *"
+                            value={form.employee_id ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, employee_id: e.target.value }))}
+                            disabled={mode === "edit"}
+                        />
+                        <TextField
+                            label="Name *"
+                            value={form.name ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+                        />
+                        <TextField
+                            label="Reference"
+                            value={form.reference ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, reference: e.target.value }))}
+                        />
+                        <TextField
+                            label="Company"
+                            value={form.company ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, company: e.target.value }))}
+                        />
+                        <TextField
+                            label="Location"
+                            value={form.location ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))}
+                        />
+                        <TextField
+                            label="Position"
+                            value={form.position ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, position: e.target.value }))}
+                        />
+                        <TextField
+                            label="Phone"
+                            value={form.phone ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))}
+                        />
+                        <TextField
+                            label="Per Diem"
+                            type="number"
+                            value={form.per_diem ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, per_diem: e.target.value }))}
+                        />
+                        <TextField
+                            label="Labor Rate"
+                            type="number"
+                            value={form.labor_rate ?? ""}
+                            onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
+                        />
+                    </Box>
+                    {error && (
+                        <Typography color="error" variant="body2" sx={{ mt: 2 }}>
+                            {error}
+                        </Typography>
+                    )}
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setOpen(false)}>Cancel</Button>
+                    <Button onClick={save} variant="contained" disabled={saving}>
+                        {saving ? "Saving..." : "Save"}
+                    </Button>
+                </DialogActions>
+            </Dialog>
+        </Stack>
+    );
 }
