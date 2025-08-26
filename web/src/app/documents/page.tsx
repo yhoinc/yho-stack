@@ -2,412 +2,244 @@
 
 import React, { useEffect, useMemo, useState } from "react";
 
-const API =
-  process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, "") || "http://localhost:8000";
-
 type DocRow = {
   id: number;
-  employee_id: string | null;
-  employee_name: string;
-  doc_types: string; // comma-separated
-  object_key: string;
-  content_type: string | null;
-  size: number | null;
-  uploaded_at: string;
+  key: string;
+  employee_name?: string | null;
+  employee_id?: string | null;
+  doc_types?: string | null;   // comma separated
+  size?: number | null;
+  content_type?: string | null;
+  uploaded_at?: string | null;
 };
 
-function fmtBytes(n?: number | null) {
-  if (!n || n <= 0) return "—";
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(1)} ${u[i]}`;
-}
-
-function fmtDate(iso?: string) {
-  if (!iso) return "—";
-  try {
-    const d = new Date(iso);
-    return d.toLocaleString();
-  } catch {
-    return iso;
-  }
-}
+const API = process.env.NEXT_PUBLIC_API_BASE; // e.g. https://yho-stack.onrender.com
 
 export default function DocumentsPage() {
-  // Upload form state
-  const [employeeName, setEmployeeName] = useState("");
-  const [employeeId, setEmployeeId] = useState("");
-  const [docTax, setDocTax] = useState(false);
-  const [docId, setDocId] = useState(false);
-  const [docDeposit, setDocDeposit] = useState(false);
-  const [file, setFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  // Search state
-  const [q, setQ] = useState("");
   const [rows, setRows] = useState<DocRow[]>([]);
-  const [loadingList, setLoadingList] = useState(false);
-  const [refreshTick, setRefreshTick] = useState(0);
+  const [q, setQ] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-  const docTypes = useMemo(() => {
-    const arr: string[] = [];
-    if (docTax) arr.push("tax");
-    if (docId) arr.push("id");
-    if (docDeposit) arr.push("deposit");
-    return arr;
-  }, [docTax, docId, docDeposit]);
+  // upload form
+  const [empName, setEmpName] = useState("");
+  const [empId, setEmpId] = useState("");
+  const [types, setTypes] = useState<string[]>([]);
+  const [file, setFile] = useState<File | null>(null);
 
-  async function handleUpload(e: React.FormEvent) {
-    e.preventDefault();
-    setMessage(null);
-    setError(null);
+  const tags = ["tax", "id", "deposit", "w4", "i9"];
 
-    if (!file) {
-      setError("Please choose a file.");
-      return;
-    }
-    if (!employeeName.trim()) {
-      setError("Employee name is required.");
-      return;
-    }
-
+  async function syncAndLoad(query?: string) {
+    setLoading(true);
+    setErr(null);
     try {
-      setUploading(true);
-
-      // 1) Ask API for presigned PUT
-      const presignRes = await fetch(`${API}/documents/presign-upload`, {
+      // 1) sync from R2→DB (idempotent)
+      await fetch(`${API}/documents/sync`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          employee_name: employeeName.trim(),
-          employee_id: employeeId.trim() || null,
-          doc_types: docTypes,
-          filename: file.name,
-          content_type: file.type || "application/octet-stream",
-        }),
+        body: JSON.stringify({}) // optionally { prefix: "employees/" }
       });
-      if (!presignRes.ok) throw new Error(await presignRes.text());
-      const presigned = await presignRes.json() as {
-        key: string;
-        upload_url: string;
-        headers?: Record<string, string>;
-      };
 
-      // 2) Upload directly to R2
-      const putHeaders = new Headers(presigned.headers || {});
-      if (!putHeaders.has("Content-Type") && file.type) {
-        putHeaders.set("Content-Type", file.type);
-      }
-      const putRes = await fetch(presigned.upload_url, {
-        method: "PUT",
-        headers: putHeaders,
-        body: file,
-      });
-      if (!putRes.ok) throw new Error(`Upload failed: ${putRes.status} ${putRes.statusText}`);
-
-      // 3) Tell API to save metadata
-      const saveRes = await fetch(`${API}/documents/save`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          key: presigned.key,
-          employee_name: employeeName.trim(),
-          employee_id: employeeId.trim() || null,
-          doc_types: docTypes,
-          size: file.size,
-          content_type: file.type || "application/octet-stream",
-        }),
-      });
-      if (!saveRes.ok) throw new Error(await saveRes.text());
-      const saved = await saveRes.json();
-
-      setMessage(`Uploaded ✓ (doc id ${saved.id})`);
-      setFile(null);
-      // light reset
-      setRefreshTick((x) => x + 1); // refresh list
-    } catch (err: any) {
-      setError(err?.message || "Upload failed");
-    } finally {
-      setUploading(false);
-    }
-  }
-
-  async function loadList() {
-    setLoadingList(true);
-    setError(null);
-    try {
-      const url = new URL(`${API}/documents/search`);
-      if (q.trim()) url.searchParams.set("q", q.trim());
-      url.searchParams.set("limit", "50");
-      const res = await fetch(url.toString());
+      // 2) fetch list
+      const res = await fetch(`${API}/documents${query ? `?q=${encodeURIComponent(query)}` : ""}`);
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
       setRows(data.rows || []);
-    } catch (err: any) {
-      setError(err?.message || "Failed to load documents");
+    } catch (e: any) {
+      console.error(e);
+      setErr(e.message || "Failed to load documents");
     } finally {
-      setLoadingList(false);
+      setLoading(false);
     }
   }
 
   useEffect(() => {
-    loadList();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshTick]);
+    syncAndLoad();
+  }, []);
 
-  async function downloadDoc(id: number) {
+  async function onSearch(e: React.FormEvent) {
+    e.preventDefault();
+    await syncAndLoad(q);
+  }
+
+  async function onDownload(key: string) {
     try {
-      const res = await fetch(`${API}/documents/${id}/download`);
-      if (!res.ok) throw new Error(await res.text());
+      const res = await fetch(`${API}/documents/presign/download`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key })
+      });
       const data = await res.json();
-      if (data.url) window.open(data.url, "_blank");
-    } catch (err: any) {
-      setError(err?.message || "Unable to open document");
+      window.open(data.url, "_blank");
+    } catch (e) {
+      alert("Download failed");
     }
   }
 
-  async function deleteDoc(id: number) {
-    if (!confirm("Delete this document? This cannot be undone.")) return;
+  async function onUpload(e: React.FormEvent) {
+    e.preventDefault();
+    if (!file) {
+      alert("Choose a file first");
+      return;
+    }
+
     try {
-      const res = await fetch(`${API}/documents/${id}`, { method: "DELETE" });
-      if (!res.ok) throw new Error(await res.text());
-      setRows((prev) => prev.filter((r) => r.id !== id));
-    } catch (err: any) {
-      setError(err?.message || "Delete failed");
+      // 1) presign PUT
+      const presign = await fetch(`${API}/documents/presign/upload`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          filename: file.name,
+          content_type: file.type || "application/octet-stream",
+        }),
+      });
+      if (!presign.ok) throw new Error(await presign.text());
+      const { key, url } = await presign.json();
+
+      // 2) upload to R2
+      const put = await fetch(url, {
+        method: "PUT",
+        headers: { "Content-Type": file.type || "application/octet-stream" },
+        body: file,
+      });
+      if (!put.ok) throw new Error(`PUT failed: ${put.status}`);
+
+      // 3) save metadata in DB
+      const save = await fetch(`${API}/documents/save`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key,
+          employee_name: empName || null,
+          employee_id: empId || null,
+          doc_types: types,
+          size: file.size,
+          content_type: file.type || "application/octet-stream",
+        }),
+      });
+      if (!save.ok) throw new Error(await save.text());
+
+      // 4) reload list
+      setEmpName("");
+      setEmpId("");
+      setTypes([]);
+      setFile(null);
+      (document.getElementById("file-input") as HTMLInputElement | null)?.value && ((document.getElementById("file-input") as HTMLInputElement).value = "");
+      await syncAndLoad(q);
+      alert("Uploaded!");
+    } catch (e: any) {
+      console.error(e);
+      alert(e.message || "Upload failed");
     }
   }
 
   return (
-    <div style={{ maxWidth: 1100, margin: "0 auto" }}>
-      <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 8 }}>Documents</h1>
-      <p style={{ color: "#555", marginBottom: 24 }}>
-        Upload employee documents to Cloudflare R2 and search / download them.
-      </p>
+    <div style={{ maxWidth: 1100, margin: "0 auto", padding: 16 }}>
+      <h1 style={{ fontWeight: 700, marginBottom: 12 }}>Employee Documents</h1>
 
-      {/* Upload Card */}
-      <section
-        style={{
-          border: "1px solid #e5e7eb",
-          borderRadius: 12,
-          padding: 16,
-          marginBottom: 28,
-          background: "#fff",
-        }}
-      >
-        <h2 style={{ fontSize: 18, fontWeight: 700, marginBottom: 12 }}>Upload</h2>
+      <form onSubmit={onSearch} style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+        <input
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Search by filename, employee name, or tags…"
+          style={{ flex: 1, padding: "8px 10px", border: "1px solid #e5e7eb", borderRadius: 8 }}
+        />
+        <button
+          type="submit"
+          style={{ padding: "8px 14px", borderRadius: 8, border: "1px solid #d1d5db", background: "#111827", color: "#fff" }}
+        >
+          {loading ? "Loading…" : "Search"}
+        </button>
+      </form>
 
-        <form onSubmit={handleUpload} style={{ display: "grid", gap: 12 }}>
-          <div>
-            <label style={{ display: "block", fontWeight: 600, marginBottom: 6 }}>
-              Employee Name
-            </label>
-            <input
-              value={employeeName}
-              onChange={(e) => setEmployeeName(e.target.value)}
-              placeholder="e.g. Ana Gomez"
-              required
-              style={{
-                width: "100%",
-                border: "1px solid #d1d5db",
-                borderRadius: 8,
-                padding: "10px 12px",
-              }}
-            />
-          </div>
-
-          <div>
-            <label style={{ display: "block", fontWeight: 600, marginBottom: 6 }}>
-              Employee ID (optional)
-            </label>
-            <input
-              value={employeeId}
-              onChange={(e) => setEmployeeId(e.target.value)}
-              placeholder="e.g. EMP0083"
-              style={{
-                width: "100%",
-                border: "1px solid #d1d5db",
-                borderRadius: 8,
-                padding: "10px 12px",
-              }}
-            />
-          </div>
-
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>Document Type(s)</div>
-            <label style={{ marginRight: 16 }}>
-              <input
-                type="checkbox"
-                checked={docTax}
-                onChange={(e) => setDocTax(e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Tax Form
-            </label>
-            <label style={{ marginRight: 16 }}>
-              <input
-                type="checkbox"
-                checked={docId}
-                onChange={(e) => setDocId(e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Identification
-            </label>
-            <label>
-              <input
-                type="checkbox"
-                checked={docDeposit}
-                onChange={(e) => setDocDeposit(e.target.checked)}
-                style={{ marginRight: 6 }}
-              />
-              Direct Deposit Form
-            </label>
-          </div>
-
-          <div>
-            <div style={{ fontWeight: 600, marginBottom: 6 }}>File</div>
-            <input
-              type="file"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-            />
-          </div>
-
-          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-            <button
-              type="submit"
-              disabled={uploading}
-              style={{
-                background: "#111827",
-                color: "white",
-                fontWeight: 600,
-                borderRadius: 8,
-                padding: "10px 14px",
-                border: "none",
-                cursor: "pointer",
-                opacity: uploading ? 0.7 : 1,
-              }}
-            >
-              {uploading ? "Uploading…" : "Upload"}
-            </button>
-            {message && <span style={{ color: "#065f46" }}>{message}</span>}
-            {error && <span style={{ color: "#b91c1c" }}>{error}</span>}
-          </div>
-        </form>
-      </section>
-
-      {/* Search / List */}
-      <section
-        style={{
-          border: "1px solid #e5e7eb",
-          borderRadius: 12,
-          padding: 16,
-          background: "#fff",
-        }}
-      >
-        <div style={{ display: "flex", gap: 12, alignItems: "center", marginBottom: 12, flexWrap: "wrap" }}>
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search name, type, or key…"
-            style={{
-              flex: "1 1 240px",
-              minWidth: 220,
-              border: "1px solid #d1d5db",
-              borderRadius: 8,
-              padding: "10px 12px",
-            }}
-          />
-          <button
-            onClick={loadList}
-            disabled={loadingList}
-            style={{
-              background: "#2563eb",
-              color: "white",
-              fontWeight: 600,
-              borderRadius: 8,
-              padding: "10px 14px",
-              border: "none",
-              cursor: "pointer",
-              opacity: loadingList ? 0.7 : 1,
-            }}
-          >
-            {loadingList ? "Searching…" : "Search"}
-          </button>
+      {err && (
+        <div style={{ background: "#fee2e2", border: "1px solid #fecaca", padding: 10, borderRadius: 8, marginBottom: 12 }}>
+          {err}
         </div>
+      )}
 
-        <div style={{ overflowX: "auto" }}>
-          <table style={{ width: "100%", borderCollapse: "collapse" }}>
-            <thead>
-              <tr style={{ textAlign: "left", borderBottom: "1px solid #e5e7eb" }}>
-                <th style={{ padding: "8px 6px" }}>Employee</th>
-                <th style={{ padding: "8px 6px" }}>Types</th>
-                <th style={{ padding: "8px 6px" }}>Size</th>
-                <th style={{ padding: "8px 6px" }}>Uploaded</th>
-                <th style={{ padding: "8px 6px" }}>Actions</th>
+      <div style={{ overflowX: "auto", border: "1px solid #e5e7eb", borderRadius: 12, marginBottom: 20 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 800 }}>
+          <thead style={{ background: "#f3f4f6" }}>
+            <tr>
+              <th style={th}>Key</th>
+              <th style={th}>Employee</th>
+              <th style={th}>Tags</th>
+              <th style={th}>Size</th>
+              <th style={th}>Uploaded</th>
+              <th style={th}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <td style={td} title={r.key}>{r.key}</td>
+                <td style={td}>{r.employee_name || ""}</td>
+                <td style={td}>{r.doc_types || ""}</td>
+                <td style={td}>{r.size ? niceBytes(r.size) : ""}</td>
+                <td style={td}>{r.uploaded_at ? new Date(r.uploaded_at).toLocaleString() : ""}</td>
+                <td style={tdRight}>
+                  <button onClick={() => onDownload(r.key)} style={btn}>Download</button>
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {rows.map((r) => (
-                <tr key={r.id} style={{ borderBottom: "1px solid #f3f4f6" }}>
-                  <td style={{ padding: "8px 6px", whiteSpace: "nowrap" }}>
-                    <div style={{ fontWeight: 600 }}>{r.employee_name}</div>
-                    <div style={{ color: "#6b7280", fontSize: 12 }}>{r.employee_id || "—"}</div>
-                  </td>
-                  <td style={{ padding: "8px 6px" }}>{r.doc_types || "—"}</td>
-                  <td style={{ padding: "8px 6px" }}>{fmtBytes(r.size)}</td>
-                  <td style={{ padding: "8px 6px" }}>{fmtDate(r.uploaded_at)}</td>
-                  <td style={{ padding: "8px 6px" }}>
-                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      <button
-                        onClick={() => downloadDoc(r.id)}
-                        style={{
-                          background: "#111827",
-                          color: "#fff",
-                          borderRadius: 6,
-                          padding: "6px 10px",
-                          border: "none",
-                          cursor: "pointer",
-                        }}
-                      >
-                        Open
-                      </button>
-                      <button
-                        onClick={() => deleteDoc(r.id)}
-                        style={{
-                          background: "#dc2626",
-                          color: "#fff",
-                          borderRadius: 6,
-                          padding: "6px 10px",
-                          border: "none",
-                          cursor: "pointer",
-                        }}
-                      >
-                        Delete
-                      </button>
-                    </div>
-                    <div style={{ color: "#6b7280", fontSize: 12, marginTop: 4 }}>
-                      <span title={r.object_key}>{r.object_key}</span>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-              {rows.length === 0 && !loadingList && (
-                <tr>
-                  <td colSpan={5} style={{ padding: 12, color: "#6b7280" }}>
-                    No documents found.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
+            ))}
+            {rows.length === 0 && (
+              <tr><td colSpan={6} style={{ padding: 16, textAlign: "center", color: "#6b7280" }}>No documents</td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <h2 style={{ fontWeight: 700, marginBottom: 10 }}>Upload</h2>
+      <form onSubmit={onUpload} style={{ display: "grid", gap: 10, maxWidth: 700 }}>
+        <input
+          value={empName}
+          onChange={(e) => setEmpName(e.target.value)}
+          placeholder="Employee name (optional)"
+          style={input}
+        />
+        <input
+          value={empId}
+          onChange={(e) => setEmpId(e.target.value)}
+          placeholder="Employee ID (optional)"
+          style={input}
+        />
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {tags.map((t) => {
+            const on = types.includes(t);
+            return (
+              <label key={t} style={{ display: "inline-flex", gap: 6, alignItems: "center", padding: "6px 10px", border: "1px solid #e5e7eb", borderRadius: 999, background: on ? "#e0e7ff" : "#fff" }}>
+                <input
+                  type="checkbox"
+                  checked={on}
+                  onChange={(e) => {
+                    if (e.target.checked) setTypes((p) => [...p, t]);
+                    else setTypes((p) => p.filter((x) => x !== t));
+                  }}
+                />
+                {t}
+              </label>
+            );
+          })}
         </div>
-      </section>
+
+        <input id="file-input" type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        <button type="submit" style={{ ...btn, alignSelf: "start", background: "#111827", color: "#fff" }}>Upload</button>
+      </form>
     </div>
   );
+}
+
+const th: React.CSSProperties = { textAlign: "left", padding: "10px 12px", fontWeight: 600, fontSize: 13, color: "#374151", borderBottom: "1px solid #e5e7eb" };
+const td: React.CSSProperties = { padding: "10px 12px", borderBottom: "1px solid #f3f4f6", fontSize: 13, color: "#111827", maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" };
+const tdRight: React.CSSProperties = { ...td, textAlign: "right" };
+const btn: React.CSSProperties = { padding: "6px 10px", borderRadius: 8, border: "1px solid #d1d5db", background: "#fff" };
+const input: React.CSSProperties = { padding: "8px 10px", border: "1px solid #e5e7eb", borderRadius: 8 };
+
+function niceBytes(x: number) {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let l = 0, n = x;
+  while (n >= 1024 && ++l) n = n / 1024;
+  return `${n.toFixed(n < 10 && l > 0 ? 1 : 0)} ${units[l]}`;
 }
