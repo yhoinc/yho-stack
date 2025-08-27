@@ -1,300 +1,271 @@
-"use client";
+'use client';
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useState } from 'react';
 
 type DocRow = {
   key: string;
-  filename: string;
-  size: number;         // bytes
-  content_type: string; // e.g. application/pdf
-  uploaded_at: string;  // ISO
   employee?: string | null;
-  doc_type?: string | null;
+  type?: string | null;
+  size: number;
+  uploaded: string; // ISO timestamp
 };
 
-const API = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8000";
-
-// simple bytes → human string
-function fmtBytes(b: number): string {
-  if (b === 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const i = Math.floor(Math.log(b) / Math.log(1024));
-  return `${(b / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
-}
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE?.replace(/\/+$/, '') || ''; 
+// If API_BASE is empty, the code will call relative paths (requires the rewrite in next.config.ts).
 
 export default function DocumentsPage() {
   const [rows, setRows] = useState<DocRow[]>([]);
-  const [loading, setLoading] = useState<boolean>(true);
+  const [loading, setLoading] = useState(false);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [query, setQuery] = useState<string>("");
-  const [syncing, setSyncing] = useState<boolean>(false);
-  const [uploading, setUploading] = useState<boolean>(false);
 
-  const fileRef = useRef<HTMLInputElement | null>(null);
-  const empRef = useRef<HTMLInputElement | null>(null);
-  const taxRef = useRef<HTMLInputElement | null>(null);
-  const idRef = useRef<HTMLInputElement | null>(null);
-  const ddRef = useRef<HTMLInputElement | null>(null);
+  // upload state
+  const [employeeName, setEmployeeName] = useState('');
+  const [types, setTypes] = useState<string[]>([]);
+  const [file, setFile] = useState<File | null>(null);
 
-  // ----------- data fetching ----------- //
-  async function fetchList() {
+  // search
+  const [query, setQuery] = useState('');
+  const [typing, setTyping] = useState('');
+
+  // Format helpers
+  const fmtSize = (n: number) => {
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)} KB`;
+    return `${n} B`;
+  };
+  const fmtDate = (iso: string) =>
+    new Date(iso).toLocaleString(undefined, {
+      year: 'numeric',
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+
+  const listUrl = useMemo(() => {
+    const base = API_BASE || '';
+    const qs = new URLSearchParams();
+    if (query.trim()) qs.set('prefix', query.trim());
+    qs.set('limit', '500');
+    return `${base}/documents?${qs.toString()}`;
+  }, [query]);
+
+  async function load() {
     setLoading(true);
+    setError(null);
     try {
-      const r = await fetch(`${API}/documents`, { method: "GET", cache: "no-store" });
-      if (!r.ok) throw new Error(`List failed (${r.status})`);
-      const data = await r.json() as { rows: DocRow[] };
-      setRows(data.rows ?? []);
-      setError(null);
-    } catch (e: unknown) {
-      setError((e as Error).message);
+      const res = await fetch(listUrl, { cache: 'no-store' });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`${res.status} ${res.statusText} – ${text}`);
+      }
+      const data = (await res.json()) as { rows: DocRow[]; total: number };
+      setRows(data.rows || []);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to load documents');
     } finally {
       setLoading(false);
     }
   }
 
-  useEffect(() => {
-    fetchList();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ----------- sync button ----------- //
-  async function syncFromBucket() {
+  async function syncBucket() {
     setSyncing(true);
+    setError(null);
     try {
-      const r = await fetch(`${API}/documents`, { method: "GET", cache: "no-store" });
-      if (!r.ok) throw new Error(`Sync failed (${r.status})`);
-      const data = await r.json() as { rows: DocRow[] };
-      setRows(data.rows ?? []);
-      setError(null);
-    } catch (e: unknown) {
-      setError((e as Error).message);
+      const res = await fetch(`${API_BASE}/documents/sync`, {
+        method: 'POST',
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`${res.status} ${res.statusText} – ${text}`);
+      }
+      await load();
+    } catch (e: any) {
+      setError(e?.message || 'Sync failed');
     } finally {
       setSyncing(false);
     }
   }
 
-  // ----------- upload ----------- //
-  async function handleUpload(e: React.FormEvent) {
+  async function onUpload(e: React.FormEvent) {
     e.preventDefault();
-    const file = fileRef.current?.files?.[0];
     if (!file) {
-      alert("Choose a file first.");
+      setError('Choose a file to upload.');
       return;
     }
-    const employee = empRef.current?.value?.trim() || "";
-    const parts: string[] = [];
-    if (taxRef.current?.checked) parts.push("tax");
-    if (idRef.current?.checked) parts.push("id");
-    if (ddRef.current?.checked) parts.push("directdeposit");
-    const docType = parts.join("_");
-
-    const formData = new FormData();
-    formData.append("file", file);
-    if (employee) formData.append("employee", employee);
-    if (docType) formData.append("doc_type", docType);
-
-    setUploading(true);
+    setError(null);
     try {
-      const r = await fetch(`${API}/documents/upload`, {
-        method: "POST",
-        body: formData,
+      const form = new FormData();
+      form.append('file', file);
+      if (employeeName.trim()) form.append('employee', employeeName.trim());
+      if (types.length) form.append('types', types.join(','));
+
+      const res = await fetch(`${API_BASE}/documents/upload`, {
+        method: 'POST',
+        body: form,
       });
-      if (!r.ok) throw new Error(`Upload failed (${r.status})`);
-      // refresh list
-      await fetchList();
-      // reset inputs
-      if (fileRef.current) fileRef.current.value = "";
-      if (empRef.current) empRef.current.value = "";
-      if (taxRef.current) taxRef.current.checked = false;
-      if (idRef.current) idRef.current.checked = false;
-      if (ddRef.current) ddRef.current.checked = false;
-      setError(null);
-    } catch (e: unknown) {
-      setError((e as Error).message);
-    } finally {
-      setUploading(false);
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`${res.status} ${res.statusText} – ${text}`);
+      }
+      // reset form & refresh list
+      setFile(null);
+      (document.getElementById('file-input') as HTMLInputElement)?.value && ((document.getElementById('file-input') as HTMLInputElement).value = '');
+      await load();
+    } catch (e: any) {
+      setError(e?.message || 'Upload failed');
     }
   }
 
-  // ----------- actions ----------- //
-  function previewUrl(key: string, inline = true) {
-    const disp = inline ? "inline" : "attachment";
-    // FastAPI endpoint streams file with optional disposition
-    return `${API}/documents/${encodeURIComponent(key)}?disposition=${disp}`;
-  }
+  // Debounce search input -> real query
+  useEffect(() => {
+    const t = setTimeout(() => setQuery(typing), 350);
+    return () => clearTimeout(t);
+  }, [typing]);
 
-  async function deleteDoc(key: string) {
-    if (!confirm("Delete this document?")) return;
-    try {
-      const r = await fetch(`${API}/documents/${encodeURIComponent(key)}`, {
-        method: "DELETE",
-      });
-      if (!r.ok) throw new Error(`Delete failed (${r.status})`);
-      setRows((prev) => prev.filter((x) => x.key !== key));
-    } catch (e: unknown) {
-      alert((e as Error).message);
-    }
-  }
+  // Load on mount and when query changes
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [listUrl]);
 
-  // ----------- filter on client ----------- //
-  const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return rows;
-    return rows.filter((r) => {
-      return (
-        r.filename.toLowerCase().includes(q) ||
-        (r.employee ?? "").toLowerCase().includes(q) ||
-        (r.doc_type ?? "").toLowerCase().includes(q) ||
-        r.key.toLowerCase().includes(q)
-      );
-    });
-  }, [rows, query]);
+  // Toggle a type checkbox
+  function toggleType(v: string) {
+    setTypes((prev) => (prev.includes(v) ? prev.filter((x) => x !== v) : [...prev, v]));
+  }
 
   return (
-    <div className="space-y-6">
-      <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h1 className="text-2xl font-semibold">Employee Documents</h1>
-        <div className="flex items-center gap-2">
+    <div className="mx-auto max-w-6xl px-4 py-6">
+      <h1 className="text-3xl font-bold mb-4">Employee Documents</h1>
+
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex gap-2">
           <button
-            onClick={syncFromBucket}
+            onClick={syncBucket}
             disabled={syncing}
-            className="rounded-md bg-sky-600 px-3 py-2 text-white hover:bg-sky-700 disabled:opacity-50"
+            className="rounded-md bg-blue-600 px-3 py-2 text-white text-sm disabled:opacity-50"
+            title="Scan R2 bucket and add any new files to the database"
           >
-            {syncing ? "Syncing..." : "Sync with Bucket"}
+            {syncing ? 'Syncing…' : 'Sync with Bucket'}
           </button>
           <input
             placeholder="Search by file/employee/type…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            className="w-64 rounded-md border border-gray-300 px-3 py-2 text-sm"
+            className="rounded-md border px-3 py-2 text-sm w-72"
+            value={typing}
+            onChange={(e) => setTyping(e.target.value)}
           />
         </div>
-      </header>
+        {error && <div className="text-red-600 text-sm">{error}</div>}
+      </div>
 
-      {/* Upload form */}
-      <section className="rounded-lg border border-gray-200 p-4">
-        <form onSubmit={handleUpload} className="grid gap-3 md:grid-cols-3">
-          <div className="flex flex-col">
-            <label className="text-sm font-medium mb-1">Employee Name</label>
+      {/* Upload card */}
+      <form
+        onSubmit={onUpload}
+        className="mt-6 rounded-xl border bg-white p-4 shadow-sm"
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <label className="text-sm">
+            <div className="mb-1 font-medium">Employee Name</div>
             <input
-              ref={empRef}
-              type="text"
+              className="w-full rounded-md border px-3 py-2"
               placeholder="e.g. Jane Doe"
-              className="rounded-md border border-gray-300 px-3 py-2"
+              value={employeeName}
+              onChange={(e) => setEmployeeName(e.target.value)}
             />
-          </div>
+          </label>
 
-          <div className="flex flex-col">
-            <span className="text-sm font-medium mb-1">Document Type(s)</span>
-            <div className="flex flex-wrap gap-4 rounded-md border border-gray-200 px-3 py-2">
-              <label className="flex items-center gap-2 text-sm">
-                <input ref={taxRef} type="checkbox" /> Tax Form
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input ref={idRef} type="checkbox" /> Identification
-              </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input ref={ddRef} type="checkbox" /> Direct Deposit Form
-              </label>
+          <div className="text-sm">
+            <div className="mb-1 font-medium">Document Type(s)</div>
+            <div className="flex flex-wrap gap-4 items-center">
+              {['Tax Form', 'Identification', 'Direct Deposit Form'].map((t) => (
+                <label key={t} className="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={types.includes(t)}
+                    onChange={() => toggleType(t)}
+                  />
+                  <span>{t}</span>
+                </label>
+              ))}
             </div>
           </div>
 
-          <div className="flex flex-col">
-            <label className="text-sm font-medium mb-1">Upload File</label>
-            <input ref={fileRef} type="file" className="rounded-md border border-gray-300 px-3 py-2" />
-          </div>
+          <label className="text-sm">
+            <div className="mb-1 font-medium">Upload File</div>
+            <input
+              id="file-input"
+              type="file"
+              accept="application/pdf,image/*"
+              onChange={(e) => setFile(e.target.files?.[0] || null)}
+            />
+          </label>
 
-          <div className="md:col-span-3">
+          <div className="flex items-end">
             <button
               type="submit"
-              disabled={uploading}
-              className="rounded-md bg-emerald-600 px-4 py-2 text-white hover:bg-emerald-700 disabled:opacity-50"
+              className="rounded-md bg-green-600 px-4 py-2 text-white text-sm"
             >
-              {uploading ? "Uploading…" : "Upload"}
+              Upload
             </button>
           </div>
-        </form>
-      </section>
+        </div>
+      </form>
 
       {/* List */}
-      <section className="rounded-lg border border-gray-200">
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-gray-50 text-left">
+      <div className="mt-6 overflow-x-auto rounded-xl border bg-white shadow-sm">
+        <table className="min-w-full text-sm">
+          <thead className="bg-gray-50 text-gray-700">
+            <tr>
+              <th className="px-3 py-2 text-left">File</th>
+              <th className="px-3 py-2 text-left">Employee</th>
+              <th className="px-3 py-2 text-left">Type</th>
+              <th className="px-3 py-2 text-left">Uploaded</th>
+              <th className="px-3 py-2 text-left">Size</th>
+              <th className="px-3 py-2 text-left">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && (
               <tr>
-                <th className="px-3 py-2 font-medium">File</th>
-                <th className="px-3 py-2 font-medium">Employee</th>
-                <th className="px-3 py-2 font-medium">Type</th>
-                <th className="px-3 py-2 font-medium">Size</th>
-                <th className="px-3 py-2 font-medium">Uploaded</th>
-                <th className="px-3 py-2 font-medium">Actions</th>
+                <td className="px-3 py-4 text-gray-500" colSpan={6}>
+                  Loading…
+                </td>
               </tr>
-            </thead>
-            <tbody>
-              {loading ? (
-                <tr>
-                  <td className="px-3 py-4 text-gray-500" colSpan={6}>
-                    Loading…
-                  </td>
-                </tr>
-              ) : filtered.length === 0 ? (
-                <tr>
-                  <td className="px-3 py-4 text-gray-500" colSpan={6}>
-                    No documents found.
-                  </td>
-                </tr>
-              ) : (
-                filtered.map((r) => (
-                  <tr key={r.key} className="border-t">
-                    <td className="px-3 py-2">
-                      <div className="flex flex-col">
-                        <span className="font-medium">{r.filename}</span>
-                        <span className="text-gray-500">{r.key}</span>
-                        <span className="text-gray-500">{r.content_type}</span>
-                      </div>
-                    </td>
-                    <td className="px-3 py-2">{r.employee || "-"}</td>
-                    <td className="px-3 py-2">{r.doc_type || "-"}</td>
-                    <td className="px-3 py-2">{fmtBytes(r.size)}</td>
-                    <td className="px-3 py-2">
-                      {new Date(r.uploaded_at).toLocaleString()}
-                    </td>
-                    <td className="px-3 py-2">
-                      <div className="flex flex-wrap gap-2">
-                        <a
-                          href={previewUrl(r.key, true)}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="rounded-md border border-gray-300 px-2 py-1 hover:bg-gray-50"
-                        >
-                          Preview
-                        </a>
-                        <a
-                          href={previewUrl(r.key, false)}
-                          className="rounded-md border border-gray-300 px-2 py-1 hover:bg-gray-50"
-                        >
-                          Download
-                        </a>
-                        <button
-                          onClick={() => deleteDoc(r.key)}
-                          className="rounded-md border border-red-300 px-2 py-1 text-red-700 hover:bg-red-50"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-        {error && (
-          <div className="border-t px-3 py-2 text-sm text-red-600">
-            {error}
-          </div>
-        )}
-      </section>
+            )}
+            {!loading && rows.length === 0 && (
+              <tr>
+                <td className="px-3 py-6 text-gray-500" colSpan={6}>
+                  No documents found.
+                </td>
+              </tr>
+            )}
+            {rows.map((r) => (
+              <tr key={r.key} className="border-t">
+                <td className="px-3 py-2 font-medium break-all">{r.key}</td>
+                <td className="px-3 py-2">{r.employee || '—'}</td>
+                <td className="px-3 py-2">{r.type || '—'}</td>
+                <td className="px-3 py-2">{fmtDate(r.uploaded)}</td>
+                <td className="px-3 py-2">{fmtSize(r.size)}</td>
+                <td className="px-3 py-2">
+                  <a
+                    className="text-blue-600 hover:underline"
+                    href={`${API_BASE}/documents/file/${encodeURIComponent(r.key)}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    View / Download
+                  </a>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="mt-3 text-xs text-gray-500">
+        Backend base: <code>{API_BASE || '(relative via Next.js rewrite)'}</code>
+      </p>
     </div>
   );
 }
