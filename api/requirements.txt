@@ -4,3 +4,4 @@ sqlalchemy
 pydantic==2.*
 boto3==1.34.162
 python-multipart
+certifi>=2024.7.4
