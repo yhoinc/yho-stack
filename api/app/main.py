@@ -1,55 +1,59 @@
-# main.py
+# api/app/main.py
 import os
-import io
-import re
 import uuid
-import json
-import pathlib
-import sqlite3
 import datetime
-from typing import Any, Dict, List, Optional, Tuple
+import pathlib
+from typing import Any, Dict, List, Optional, Literal
 
+import sqlite3
 from fastapi import FastAPI, Body, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
-# --- S3 / R2 ---
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 # ----------------- Config -----------------
+
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
 DB_PATH = os.environ.get("DB_PATH", "employees_with_company_v2.db")
 if not os.path.isabs(DB_PATH):
     DB_PATH = str(BASE_DIR / DB_PATH)
 
-S3_ENDPOINT = (os.environ.get("S3_ENDPOINT") or "").rstrip("/")
-S3_BUCKET = os.environ.get("S3_BUCKET") or ""
-S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID") or ""
-S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY") or ""
-S3_REGION = os.environ.get("S3_REGION") or "auto"
+S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").strip()
+S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
+S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID", "").strip()
+S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "").strip()
 
 print(f"[startup] DB_PATH={DB_PATH}")
-print(f"[startup] S3_ENDPOINT={S3_ENDPOINT!r}  S3_BUCKET={S3_BUCKET!r}")
+if S3_ENDPOINT and S3_BUCKET:
+    print(f"[startup] S3_ENDPOINT='{S3_ENDPOINT}'  S3_BUCKET='{S3_BUCKET}'")
 
 # ----------------- App --------------------
+
 app = FastAPI(title="YHO API")
+
+# Allow both Render hosts + localhost
+allowed_origins = [
+    "https://yho-stack.onrender.com",
+    "https://yho-stack-1.onrender.com",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://yho-stack-1.onrender.com",  # frontend
-        "https://yho-stack.onrender.com",    # backend itself
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ----------------- DB helpers -------------
-def connect() -> sqlite3.Connection:
+
+def connect():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
@@ -59,7 +63,8 @@ def execmany(con: sqlite3.Connection, sql: str, rows: List[tuple]):
     cur.executemany(sql, rows)
     cur.close()
 
-# ----------------- Schema Ensure ----------
+# ----------------- Payroll schema ensure -------------
+
 PAYROLL_SCHEMA = """
 create table if not exists payroll_runs (
   id              integer primary key autoincrement,
@@ -98,100 +103,17 @@ create index if not exists idx_commissions_run on commissions(run_id);
 create index if not exists idx_payroll_runs_ts on payroll_runs(run_ts_utc);
 """
 
-DOCUMENTS_SCHEMA = """
-create table if not exists documents (
-  id               integer primary key autoincrement,
-  object_key       text not null unique,
-  file_name        text not null,
-  employee         text,
-  doc_types        text,
-  size_bytes       integer,
-  etag             text,
-  last_modified_utc text,
-  uploaded_utc     text
-);
-create index if not exists idx_documents_emp on documents(employee);
-create index if not exists idx_documents_name on documents(file_name);
-"""
-
 @app.on_event("startup")
 def ensure_schema():
     con = connect()
     try:
         con.executescript(PAYROLL_SCHEMA)
-        con.executescript(DOCUMENTS_SCHEMA)
         con.commit()
     finally:
         con.close()
 
-# ----------------- S3 client (R2) ---------
-_s3_client = None
+# ----------------- Employees (existing) -----------------
 
-def s3():
-    """
-    Cloudflare R2 requires path-style addressing for TLS to succeed.
-    We also normalize the endpoint to avoid trailing slashes or accidental bucket suffixes.
-    """
-    global _s3_client
-    if _s3_client is None:
-        if not (S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET):
-            raise HTTPException(status_code=500, detail="R2/S3 not configured")
-
-        endpoint = S3_ENDPOINT.rstrip("/")
-        # If user accidentally placed the bucket into the endpoint, remove it.
-        if endpoint.endswith(f"/{S3_BUCKET}"):
-            endpoint = endpoint[: -(len(S3_BUCKET) + 1)]
-
-        _s3_client = boto3.client(
-            "s3",
-            endpoint_url=endpoint,
-            aws_access_key_id=S3_ACCESS_KEY_ID,
-            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-            region_name=S3_REGION,
-            config=BotoConfig(
-                signature_version="s3v4",
-                s3={"addressing_style": "path"},  # << important for R2 TLS
-            ),
-        )
-    return _s3_client
-
-# ----------------- Utilities --------------
-SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
-
-def slugify(s: str) -> str:
-    s = (s or "").strip()
-    s = SAFE_CHARS.sub("-", s)
-    s = re.sub(r"-+", "-", s).strip("-")
-    return s or "file"
-
-def utcnow_iso() -> str:
-    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
-
-# ----------------- Health -----------------
-@app.get("/debug/health")
-def debug_health():
-    ok = True
-    db_ok = False
-    r2_ok = False
-    # DB
-    try:
-        con = connect()
-        try:
-            con.execute("select 1")
-            db_ok = True
-        finally:
-            con.close()
-    except Exception:
-        ok = False
-    # R2
-    try:
-        s3().list_buckets()  # cheap call on R2
-        r2_ok = True
-    except Exception:
-        ok = False
-    return {"ok": ok, "db": db_ok, "r2": r2_ok}
-
-# ----------------- Employees --------------
 @app.get("/employees")
 def list_employees(limit: int = 100, offset: int = 0):
     con = connect()
@@ -249,54 +171,53 @@ def patch_employee(employee_id: str, payload: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
-# ----------------- Payroll ----------------
-@app.post("/payroll/runs")
-def create_payroll_run(payload: Dict[str, Any] = Body(...)):
-    """
-    payload = {
-      "scope": "all" | "by",
-      "company": null | "SHINBO",
-      "location": null | "TEXAS",
-      "note": "optional",
-      "items": [
-        { "employee_id": "...", "name": "...", "reference": "...",
-          "company": "...", "location": "...", "position": "...",
-          "labor_rate": 25, "week1_hours": 40, "week2_hours": 38 },
-        ...
-      ],
-      "commission": { "beneficiary": "danny", "per_hour_rate": 0.50 }
-    }
-    """
-    scope = payload.get("scope") or "all"
-    company = payload.get("company")
-    location = payload.get("location")
-    note = payload.get("note")
-    items = payload.get("items") or []
-    comm = payload.get("commission") or {"beneficiary": "danny", "per_hour_rate": 0.50}
+# ----------------- Payroll: create run (append-only) -----------------
+class PayrollItem(BaseModel):
+    employee_id: str
+    name: Optional[str] = None
+    reference: Optional[str] = None
+    company: Optional[str] = None
+    location: Optional[str] = None
+    position: Optional[str] = None
+    labor_rate: float = 0
+    week1_hours: float = 0
+    week2_hours: float = 0
 
-    run_ts_utc = utcnow_iso()
+class PayrollCreate(BaseModel):
+    scope: Literal["all", "by"] = "all"
+    company: Optional[str] = None
+    location: Optional[str] = None
+    note: Optional[str] = None
+    items: List[PayrollItem] = []
+    commission: Optional[Dict[str, Any]] = None
+
+@app.post("/payroll/runs")
+def create_payroll_run(payload: PayrollCreate):
+    scope = payload.scope
+    company = payload.company
+    location = payload.location
+    note = payload.note
+    items = payload.items
+    comm = payload.commission or {"beneficiary": "danny", "per_hour_rate": 0.50}
+
+    run_ts_utc = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
     run_key = f"{run_ts_utc}-{uuid.uuid4().hex[:8]}"
 
-    prepared: List[Tuple] = []
+    prepared = []
     total_hours_sum = 0.0
     for it in items:
-        w1 = float(it.get("week1_hours") or 0)
-        w2 = float(it.get("week2_hours") or 0)
+        w1 = float(it.week1_hours or 0)
+        w2 = float(it.week2_hours or 0)
         hrs = w1 + w2
-        rate = float(it.get("labor_rate") or 0)
+        rate = float(it.labor_rate or 0)
         total = rate * hrs
         total_hours_sum += hrs
         prepared.append((
-            it.get("employee_id"),
-            it.get("name"),
-            it.get("reference"),
-            it.get("company"),
-            it.get("location"),
-            it.get("position"),
-            rate, w1, w2, hrs, total
+            it.employee_id, it.name, it.reference, it.company, it.location,
+            it.position, rate, w1, w2, hrs, total
         ))
 
-    ben = comm.get("beneficiary") or "danny"
+    ben = (comm.get("beneficiary") or "danny").lower()
     per_hr = float(comm.get("per_hour_rate") or 0.50)
     commission_total = per_hr * total_hours_sum
 
@@ -336,6 +257,7 @@ def create_payroll_run(payload: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
+# ----------------- Summaries -----------------
 @app.get("/payroll/summary/hours_by_company")
 def hours_by_company(date_from: Optional[str] = None, date_to: Optional[str] = None):
     con = connect()
@@ -455,194 +377,106 @@ def commissions_summary(date_from: Optional[str] = None, date_to: Optional[str] 
     finally:
         con.close()
 
-# ----------------- Documents (R2) --------
-def upsert_document(con: sqlite3.Connection, row: Dict[str, Any]):
-    cur = con.cursor()
-    cur.execute(
-        """
-        insert into documents (object_key, file_name, employee, doc_types,
-                               size_bytes, etag, last_modified_utc, uploaded_utc)
-        values (?,?,?,?,?,?,?,?)
-        on conflict(object_key) do update set
-           file_name=excluded.file_name,
-           employee=excluded.employee,
-           doc_types=excluded.doc_types,
-           size_bytes=excluded.size_bytes,
-           etag=excluded.etag,
-           last_modified_utc=excluded.last_modified_utc
-        """,
-        (
-            row.get("object_key"),
-            row.get("file_name"),
-            row.get("employee"),
-            row.get("doc_types"),
-            row.get("size_bytes"),
-            row.get("etag"),
-            row.get("last_modified_utc"),
-            row.get("uploaded_utc"),
+# ----------------- R2 / S3 client -----------------
+
+def _s3():
+    if not (S3_ENDPOINT and S3_BUCKET and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
+        raise HTTPException(status_code=500, detail="R2/S3 not configured")
+    session = boto3.session.Session()
+    client = session.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY_ID,
+        aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        config=BotoConfig(
+            s3={"addressing_style": "virtual"},
+            signature_version="s3v4",
+            retries={"max_attempts": 3, "mode": "standard"},
         ),
+        region_name="auto",
+        verify=True,
     )
+    return client
+
+# ----------------- Documents API -----------------
+
+class DocRow(BaseModel):
+    key: str
+    size: int
+    modified: Optional[str] = None
+    url: Optional[str] = None
 
 @app.get("/documents")
-def documents_list(
-    q: Optional[str] = None,
-    limit: int = Query(50, ge=1, le=500),
-    page: int = Query(1, ge=1),
+def list_documents(
+    limit: int = Query(50, ge=1, le=1000),
+    prefix: str = "",
 ):
-    offset = (page - 1) * limit
-    con = connect()
+    """
+    List rows from R2 (no DB state yet).
+    """
+    client = _s3()
     try:
-        base = "from documents where 1=1"
-        params: List[Any] = []
-        if q:
-            base += " and (file_name like ? or employee like ? or doc_types like ?)"
-            t = f"%{q}%"
-            params.extend([t, t, t])
+        resp = client.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, MaxKeys=limit)
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=f"R2 list error: {e}")
 
-        total = con.execute(f"select count(*) {base}", params).fetchone()[0]
-        rows = [dict(r) for r in con.execute(
-            f"select * {base} order by last_modified_utc desc, file_name limit ? offset ?",
-            params + [limit, offset]
-        )]
-        return {"rows": rows, "page": page, "page_size": limit, "total": total}
-    finally:
-        con.close()
+    rows: List[DocRow] = []
+    for obj in resp.get("Contents", []):
+        rows.append(DocRow(
+            key=obj["Key"],
+            size=int(obj.get("Size", 0)),
+            modified=obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
+            url=None,  # private bucket; we’re not exposing presigned URLs here
+        ))
+    return {"rows": [r.dict() for r in rows], "page": 1, "page_size": limit, "total": len(rows)}
 
 @app.post("/documents/sync")
-def documents_sync():
+def sync_documents():
     """
-    Pull the object list from R2 and mirror into the 'documents' table.
+    Placeholder for future DB syncing; for now just proves we can touch the bucket.
     """
-    client = s3()
-    con = connect()
+    client = _s3()
     try:
-        # list in pages
-        token = None
-        seen = 0
-        while True:
-            kw = dict(Bucket=S3_BUCKET, MaxKeys=1000)
-            if token:
-                kw["ContinuationToken"] = token
-            resp = client.list_objects_v2(**kw)
-            contents = resp.get("Contents", []) or []
-            for obj in contents:
-                key = obj.get("Key")
-                size = obj.get("Size")
-                etag = (obj.get("ETag") or "").strip('"')
-                lm = obj.get("LastModified")
-                lm_iso = lm.astimezone(datetime.timezone.utc).isoformat() if lm else None
-                file_name = key.split("/")[-1]
-                # try to parse hints from name: e.g. "Jane-Doe__Identification__...__file.pdf"
-                employee = None
-                doc_types = None
-                parts = file_name.split("__")
-                if len(parts) >= 3:
-                    employee = parts[0].replace("-", " ")
-                    doc_types = parts[1].replace("-", " ")
-
-                upsert_document(con, {
-                    "object_key": key,
-                    "file_name": file_name,
-                    "employee": employee,
-                    "doc_types": doc_types,
-                    "size_bytes": size,
-                    "etag": etag,
-                    "last_modified_utc": lm_iso,
-                    "uploaded_utc": None,
-                })
-                seen += 1
-
-            if resp.get("IsTruncated"):
-                token = resp.get("NextContinuationToken")
-            else:
-                break
-
-        con.commit()
-        return {"ok": True, "synced": seen}
+        client.head_bucket(Bucket=S3_BUCKET)
     except ClientError as e:
-        detail = getattr(e, "response", {}).get("Error", {}).get("Message") or str(e)
-        raise HTTPException(status_code=500, detail=f"R2 list error: {detail}")
-    finally:
-        con.close()
+        raise HTTPException(status_code=500, detail=f"R2 head error: {e}")
+    return {"ok": True}
 
 @app.post("/documents/upload")
-async def documents_upload(
-    employee_name: str = Form(""),
-    doc_types: str = Form(""),
+def upload_document(
+    employee: str = Form(""),
+    types: Optional[str] = Form(None),  # comma-separated from checkboxes
     file: UploadFile = File(...),
 ):
     """
-    Upload a document to R2 and record it in the DB.
-
-    Frontend typically joins selected types with commas (e.g., "Tax Form,Identification")
+    Upload a single file into the bucket. Object key pattern:
+      <employee>__<types>__<uuid>__<original-name>
     """
-    client = s3()
-    emp_slug = slugify(employee_name)
-    types_slug = slugify(doc_types.replace(",", "-"))
-    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    base_name = slugify(pathlib.Path(file.filename).name)
-    key = f"{emp_slug}__{types_slug}__{ts}__{base_name}".strip("_")
+    client = _s3()
 
-    buf = await file.read()
-    fobj = io.BytesIO(buf)
+    clean_emp = (employee or "").strip().replace(" ", "")
+    clean_types = (types or "").strip().replace(" ", "")
+    key = f"{clean_emp or 'unknown'}__{clean_types or 'doc'}__{uuid.uuid4().hex}__{file.filename}"
 
     try:
-        client.upload_fileobj(
-            fobj,
-            S3_BUCKET,
-            key,
-            ExtraArgs={"ContentType": file.content_type or "application/octet-stream"},
+        client.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=file.file,
+            ContentType=file.content_type or "application/octet-stream",
         )
     except ClientError as e:
-        detail = getattr(e, "response", {}).get("Error", {}).get("Message") or str(e)
-        raise HTTPException(status_code=500, detail=f"R2 upload error: {detail}")
+        raise HTTPException(status_code=500, detail=f"R2 upload error: {e}")
 
-    # Head the object for metadata
+    return {"ok": True, "key": key}
+
+# ----------------- Health -----------------
+
+@app.get("/debug/health")
+def health():
+    ok_db = True
     try:
-        head = client.head_object(Bucket=S3_BUCKET, Key=key)
-        size = head.get("ContentLength")
-        etag = (head.get("ETag") or "").strip('"')
-        lm = head.get("LastModified")
-        lm_iso = lm.astimezone(datetime.timezone.utc).isoformat() if lm else None
+        con = connect(); con.execute("select 1"); con.close()
     except Exception:
-        size, etag, lm_iso = len(buf), None, None
-
-    con = connect()
-    try:
-        upsert_document(con, {
-            "object_key": key,
-            "file_name": pathlib.Path(file.filename).name,
-            "employee": employee_name.strip() or None,
-            "doc_types": doc_types.strip() or None,
-            "size_bytes": size,
-            "etag": etag,
-            "last_modified_utc": lm_iso,
-            "uploaded_utc": utcnow_iso(),
-        })
-        con.commit()
-        return {"ok": True, "key": key, "size": size}
-    finally:
-        con.close()
-
-@app.get("/documents/download")
-def documents_download(key: str):
-    """
-    Stream a document from R2 to the client (inline).
-    """
-    client = s3()
-    try:
-        obj = client.get_object(Bucket=S3_BUCKET, Key=key)
-    except ClientError as e:
-        status = getattr(e, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode", 404)
-        raise HTTPException(status_code=status, detail="Not Found")
-
-    content_type = obj.get("ContentType") or "application/octet-stream"
-    body = obj["Body"]
-
-    return StreamingResponse(body, media_type=content_type)
-
-# --------------- Root (optional) ----------
-@app.get("/")
-def root():
-    return {"ok": True}
-
+        ok_db = False
+    return {"ok": True, "db": ok_db}
