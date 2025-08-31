@@ -39,7 +39,10 @@ app = FastAPI(title="YHO API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten in prod
+    allow_origins=[
+        "https://yho-stack-1.onrender.com",  # frontend
+        "https://yho-stack.onrender.com",    # backend itself
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -642,3 +645,4 @@ def documents_download(key: str):
 @app.get("/")
 def root():
     return {"ok": True}
+
