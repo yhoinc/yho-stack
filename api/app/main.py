@@ -1,111 +1,72 @@
+# main.py
 import os
 import io
-import time
+import re
 import uuid
+import json
 import pathlib
-import datetime
 import sqlite3
+import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import FastAPI, Body, HTTPException, UploadFile, File, Query
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Body, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 
+# --- S3 / R2 ---
 import boto3
 from botocore.config import Config as BotoConfig
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError
 
-
-# ------------------------------------------------------------------------------
-# Paths & environment
-# ------------------------------------------------------------------------------
-
+# ----------------- Config -----------------
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 
-# DB location (mounted disk friendly)
 DB_PATH = os.environ.get("DB_PATH", "employees_with_company_v2.db")
 if not os.path.isabs(DB_PATH):
-    DB_PATH = str((BASE_DIR / DB_PATH).resolve())
+    DB_PATH = str(BASE_DIR / DB_PATH)
 
-DATA_DIR = os.environ.get("DATA_DIR", "/data")
-if DATA_DIR and not os.path.isabs(DB_PATH):
-    # prefer /data when present
-    DB_PATH = str(pathlib.Path(DATA_DIR) / pathlib.Path(DB_PATH).name)
-
-# S3 / R2
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "").strip()
-S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID", "").strip()
-S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY", "").strip()
-S3_BUCKET = os.environ.get("S3_BUCKET", "").strip()
-S3_REGION = os.environ.get("S3_REGION", "auto")  # "auto" is fine for R2
+S3_ENDPOINT = (os.environ.get("S3_ENDPOINT") or "").rstrip("/")
+S3_BUCKET = os.environ.get("S3_BUCKET") or ""
+S3_ACCESS_KEY_ID = os.environ.get("S3_ACCESS_KEY_ID") or ""
+S3_SECRET_ACCESS_KEY = os.environ.get("S3_SECRET_ACCESS_KEY") or ""
+S3_REGION = os.environ.get("S3_REGION") or "auto"
 
 print(f"[startup] DB_PATH={DB_PATH}")
-print(f"[startup] S3_ENDPOINT={S3_ENDPOINT!r}  BUCKET={S3_BUCKET!r}")
+print(f"[startup] S3_ENDPOINT={S3_ENDPOINT!r}  S3_BUCKET={S3_BUCKET!r}")
 
-# ------------------------------------------------------------------------------
-# FastAPI app
-# ------------------------------------------------------------------------------
-
+# ----------------- App --------------------
 app = FastAPI(title="YHO API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in prod (set your web origin)
+    allow_origins=["*"],   # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ------------------------------------------------------------------------------
-# SQLite helpers
-# ------------------------------------------------------------------------------
-
+# ----------------- DB helpers -------------
 def connect() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
 
-def execmany(con: sqlite3.Connection, sql: str, rows: List[tuple]) -> None:
+def execmany(con: sqlite3.Connection, sql: str, rows: List[tuple]):
     cur = con.cursor()
     cur.executemany(sql, rows)
     cur.close()
 
-
-# ------------------------------------------------------------------------------
-# Schema
-# ------------------------------------------------------------------------------
-
-SCHEMA = """
--- Employees table (already exists in your DB, kept for safety)
-create table if not exists employees (
-  employee_id   text primary key,
-  reference     text,
-  company       text,
-  location      text,
-  name          text,
-  phone         text,
-  address       text,
-  position      text,
-  labor_rate    real,
-  deduction     text,
-  debt          text,
-  payment_count text,
-  apartment_id  text,
-  per_diem      real
-);
-
--- Payroll runs
+# ----------------- Schema Ensure ----------
+PAYROLL_SCHEMA = """
 create table if not exists payroll_runs (
-  id          integer primary key autoincrement,
-  run_key     text not null unique,
-  run_ts_utc  text not null,
-  scope       text not null,       -- "all" | "by"
-  company     text,
-  location    text,
-  note        text
+  id              integer primary key autoincrement,
+  run_key         text not null unique,
+  run_ts_utc      text not null,
+  scope           text not null,
+  company         text,
+  location        text,
+  note            text
 );
-
 create table if not exists payroll_items (
   id              integer primary key autoincrement,
   run_id          integer not null references payroll_runs(id) on delete cascade,
@@ -121,7 +82,6 @@ create table if not exists payroll_items (
   total_hours     real default 0,
   check_total     real default 0
 );
-
 create table if not exists commissions (
   id               integer primary key autoincrement,
   run_id           integer not null references payroll_runs(id) on delete cascade,
@@ -130,54 +90,105 @@ create table if not exists commissions (
   source_hours     real not null,
   total_commission real not null
 );
-
 create index if not exists idx_payroll_items_run on payroll_items(run_id);
 create index if not exists idx_commissions_run on commissions(run_id);
-create index if not exists idx_runs_ts on payroll_runs(run_ts_utc);
+create index if not exists idx_payroll_runs_ts on payroll_runs(run_ts_utc);
+"""
 
--- Documents catalog (R2 index)
+DOCUMENTS_SCHEMA = """
 create table if not exists documents (
-  id            integer primary key autoincrement,
-  s3_key        text not null unique,
-  file_name     text not null,
-  employee_name text,
-  doc_type      text,         -- comma separated tags
-  size          integer,
-  content_type  text,
-  uploaded_ts   text not null
+  id               integer primary key autoincrement,
+  object_key       text not null unique,
+  file_name        text not null,
+  employee         text,
+  doc_types        text,
+  size_bytes       integer,
+  etag             text,
+  last_modified_utc text,
+  uploaded_utc     text
 );
+create index if not exists idx_documents_emp on documents(employee);
+create index if not exists idx_documents_name on documents(file_name);
 """
 
 @app.on_event("startup")
-def ensure_schema() -> None:
-    # Ensure db file exists & schema ready
-    pathlib.Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+def ensure_schema():
     con = connect()
     try:
-        con.executescript(SCHEMA)
+        con.executescript(PAYROLL_SCHEMA)
+        con.executescript(DOCUMENTS_SCHEMA)
         con.commit()
-        print("[startup] schema ok")
     finally:
         con.close()
 
+# ----------------- S3 client (R2) ---------
+_s3_client = None
 
-# ------------------------------------------------------------------------------
-# Health / root
-# ------------------------------------------------------------------------------
+def s3():
+    """
+    Cloudflare R2 requires path-style addressing for TLS to succeed.
+    We also normalize the endpoint to avoid trailing slashes or accidental bucket suffixes.
+    """
+    global _s3_client
+    if _s3_client is None:
+        if not (S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET):
+            raise HTTPException(status_code=500, detail="R2/S3 not configured")
 
-@app.get("/")
-def root():
-    return {"ok": True, "db": bool(pathlib.Path(DB_PATH).exists())}
+        endpoint = S3_ENDPOINT.rstrip("/")
+        # If user accidentally placed the bucket into the endpoint, remove it.
+        if endpoint.endswith(f"/{S3_BUCKET}"):
+            endpoint = endpoint[: -(len(S3_BUCKET) + 1)]
 
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=endpoint,
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+            region_name=S3_REGION,
+            config=BotoConfig(
+                signature_version="s3v4",
+                s3={"addressing_style": "path"},  # << important for R2 TLS
+            ),
+        )
+    return _s3_client
+
+# ----------------- Utilities --------------
+SAFE_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
+
+def slugify(s: str) -> str:
+    s = (s or "").strip()
+    s = SAFE_CHARS.sub("-", s)
+    s = re.sub(r"-+", "-", s).strip("-")
+    return s or "file"
+
+def utcnow_iso() -> str:
+    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+
+# ----------------- Health -----------------
 @app.get("/debug/health")
-def health():
-    return {"ok": True, "ts": time.time()}
+def debug_health():
+    ok = True
+    db_ok = False
+    r2_ok = False
+    # DB
+    try:
+        con = connect()
+        try:
+            con.execute("select 1")
+            db_ok = True
+        finally:
+            con.close()
+    except Exception:
+        ok = False
+    # R2
+    try:
+        s3().list_buckets()  # cheap call on R2
+        r2_ok = True
+    except Exception:
+        ok = False
+    return {"ok": ok, "db": db_ok, "r2": r2_ok}
 
-
-# ------------------------------------------------------------------------------
-# Employees
-# ------------------------------------------------------------------------------
-
+# ----------------- Employees --------------
 @app.get("/employees")
 def list_employees(limit: int = 100, offset: int = 0):
     con = connect()
@@ -206,12 +217,10 @@ def get_employee(employee_id: str):
 def create_employee(payload: Dict[str, Any] = Body(...)):
     con = connect()
     try:
-        if not payload:
-            raise HTTPException(status_code=400, detail="empty")
-        keys, vals, qm = [], [], []
+        keys, vals, qmarks = [], [], []
         for k, v in payload.items():
-            keys.append(k); vals.append(v); qm.append("?")
-        sql = f"insert into employees ({', '.join(keys)}) values ({', '.join(qm)})"
+            keys.append(k); vals.append(v); qmarks.append("?")
+        sql = f"insert into employees ({', '.join(keys)}) values ({', '.join(qmarks)})"
         cur = con.cursor()
         cur.execute(sql, tuple(vals))
         con.commit()
@@ -237,13 +246,24 @@ def patch_employee(employee_id: str, payload: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
-
-# ------------------------------------------------------------------------------
-# Payroll: runs + summaries
-# ------------------------------------------------------------------------------
-
+# ----------------- Payroll ----------------
 @app.post("/payroll/runs")
 def create_payroll_run(payload: Dict[str, Any] = Body(...)):
+    """
+    payload = {
+      "scope": "all" | "by",
+      "company": null | "SHINBO",
+      "location": null | "TEXAS",
+      "note": "optional",
+      "items": [
+        { "employee_id": "...", "name": "...", "reference": "...",
+          "company": "...", "location": "...", "position": "...",
+          "labor_rate": 25, "week1_hours": 40, "week2_hours": 38 },
+        ...
+      ],
+      "commission": { "beneficiary": "danny", "per_hour_rate": 0.50 }
+    }
+    """
     scope = payload.get("scope") or "all"
     company = payload.get("company")
     location = payload.get("location")
@@ -251,10 +271,10 @@ def create_payroll_run(payload: Dict[str, Any] = Body(...)):
     items = payload.get("items") or []
     comm = payload.get("commission") or {"beneficiary": "danny", "per_hour_rate": 0.50}
 
-    run_ts_utc = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+    run_ts_utc = utcnow_iso()
     run_key = f"{run_ts_utc}-{uuid.uuid4().hex[:8]}"
 
-    prepared: List[tuple] = []
+    prepared: List[Tuple] = []
     total_hours_sum = 0.0
     for it in items:
         w1 = float(it.get("week1_hours") or 0)
@@ -313,26 +333,11 @@ def create_payroll_run(payload: Dict[str, Any] = Body(...)):
     finally:
         con.close()
 
-
-def _summary_query(base_where: str,
-                   date_from: Optional[str],
-                   date_to: Optional[str],
-                   extra_where: str = "",
-                   params: Optional[List[Any]] = None) -> Tuple[str, List[Any]]:
-    q = base_where
-    p: List[Any] = [] if params is None else list(params)
-    if date_from:
-        q += " and pr.run_ts_utc >= ?"; p.append(date_from)
-    if date_to:
-        q += " and pr.run_ts_utc <= ?"; p.append(date_to)
-    q += extra_where
-    return q, p
-
 @app.get("/payroll/summary/hours_by_company")
 def hours_by_company(date_from: Optional[str] = None, date_to: Optional[str] = None):
     con = connect()
     try:
-        base = """
+        q = """
         select pr.company as company,
                date(pr.run_ts_utc) as run_date,
                sum(pi.total_hours) as total_hours
@@ -340,9 +345,13 @@ def hours_by_company(date_from: Optional[str] = None, date_to: Optional[str] = N
         join payroll_runs pr on pr.id = pi.run_id
         where 1=1
         """
-        q, p = _summary_query(base, date_from, date_to,
-                              " group by pr.company, date(pr.run_ts_utc) order by run_date desc, company")
-        rows = [dict(r) for r in con.execute(q, p)]
+        params: List[Any] = []
+        if date_from:
+            q += " and pr.run_ts_utc >= ?"; params.append(date_from)
+        if date_to:
+            q += " and pr.run_ts_utc <= ?"; params.append(date_to)
+        q += " group by pr.company, date(pr.run_ts_utc) order by run_date desc, company"
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -351,21 +360,23 @@ def hours_by_company(date_from: Optional[str] = None, date_to: Optional[str] = N
 def hours_by_employee(date_from: Optional[str] = None, date_to: Optional[str] = None, company: Optional[str] = None):
     con = connect()
     try:
-        base = """
+        q = """
         select pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc) as run_date,
                sum(pi.total_hours) as total_hours
         from payroll_items pi
         join payroll_runs pr on pr.id = pi.run_id
         where 1=1
         """
-        extra = ""
-        p: List[Any] = []
+        params: List[Any] = []
+        if date_from:
+            q += " and pr.run_ts_utc >= ?"; params.append(date_from)
+        if date_to:
+            q += " and pr.run_ts_utc <= ?"; params.append(date_to)
         if company:
-            extra = " and pr.company = ?"; p.append(company)
-        q, p2 = _summary_query(base, date_from, date_to,
-                               " group by pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc)"
-                               " order by run_date desc, company, pi.name", p)
-        rows = [dict(r) for r in con.execute(q, p2)]
+            q += " and pr.company = ?"; params.append(company)
+        q += " group by pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc)"
+        q += " order by run_date desc, company, pi.name"
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -374,16 +385,20 @@ def hours_by_employee(date_from: Optional[str] = None, date_to: Optional[str] = 
 def payout_by_company(date_from: Optional[str] = None, date_to: Optional[str] = None):
     con = connect()
     try:
-        base = """
+        q = """
         select pr.company, date(pr.run_ts_utc) as run_date,
                sum(pi.check_total) as total_payout
         from payroll_items pi
         join payroll_runs pr on pr.id = pi.run_id
         where 1=1
         """
-        q, p = _summary_query(base, date_from, date_to,
-                              " group by pr.company, date(pr.run_ts_utc) order by run_date desc, company")
-        rows = [dict(r) for r in con.execute(q, p)]
+        params: List[Any] = []
+        if date_from:
+            q += " and pr.run_ts_utc >= ?"; params.append(date_from)
+        if date_to:
+            q += " and pr.run_ts_utc <= ?"; params.append(date_to)
+        q += " group by pr.company, date(pr.run_ts_utc) order by run_date desc, company"
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -392,21 +407,23 @@ def payout_by_company(date_from: Optional[str] = None, date_to: Optional[str] = 
 def payout_by_employee(date_from: Optional[str] = None, date_to: Optional[str] = None, company: Optional[str] = None):
     con = connect()
     try:
-        base = """
+        q = """
         select pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc) as run_date,
                sum(pi.check_total) as total_paid
         from payroll_items pi
         join payroll_runs pr on pr.id = pi.run_id
         where 1=1
         """
-        extra = ""
-        p: List[Any] = []
+        params: List[Any] = []
+        if date_from:
+            q += " and pr.run_ts_utc >= ?"; params.append(date_from)
+        if date_to:
+            q += " and pr.run_ts_utc <= ?"; params.append(date_to)
         if company:
-            extra = " and pr.company = ?"; p.append(company)
-        q, p2 = _summary_query(base, date_from, date_to,
-                               " group by pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc)"
-                               " order by run_date desc, company, pi.name", p)
-        rows = [dict(r) for r in con.execute(q, p2)]
+            q += " and pr.company = ?"; params.append(company)
+        q += " group by pi.employee_id, pi.name, pr.company, date(pr.run_ts_utc)"
+        q += " order by run_date desc, company, pi.name"
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
@@ -415,185 +432,213 @@ def payout_by_employee(date_from: Optional[str] = None, date_to: Optional[str] =
 def commissions_summary(date_from: Optional[str] = None, date_to: Optional[str] = None, beneficiary: Optional[str] = None):
     con = connect()
     try:
-        base = """
+        q = """
         select c.beneficiary, date(pr.run_ts_utc) as run_date,
                c.per_hour_rate, c.source_hours, c.total_commission
         from commissions c
         join payroll_runs pr on pr.id = c.run_id
         where 1=1
         """
-        extra = ""
-        p: List[Any] = []
+        params: List[Any] = []
+        if date_from:
+            q += " and pr.run_ts_utc >= ?"; params.append(date_from)
+        if date_to:
+            q += " and pr.run_ts_utc <= ?"; params.append(date_to)
         if beneficiary:
-            extra = " and c.beneficiary = ?"; p.append(beneficiary)
-        q, p2 = _summary_query(base, date_from, date_to, " order by run_date desc", p)
-        rows = [dict(r) for r in con.execute(q, p2)]
+            q += " and c.beneficiary = ?"; params.append(beneficiary)
+        q += " order by run_date desc"
+        rows = [dict(r) for r in connect().execute(q, params)]
         return {"rows": rows}
     finally:
         con.close()
 
-
-# ------------------------------------------------------------------------------
-# R2 / S3 client (path-style addressing!)
-# ------------------------------------------------------------------------------
-
-_s3_client = None
-
-def s3():
-    """
-    Cloudflare R2 needs PATH-STYLE addressing to avoid TLS name mismatch:
-        https://<accountid>.r2.cloudflarestorage.com/<bucket>/<key>
-    """
-    global _s3_client
-    if _s3_client is None:
-        if not (S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET):
-            raise HTTPException(status_code=500, detail="R2/S3 not configured")
-        _s3_client = boto3.client(
-            "s3",
-            endpoint_url=S3_ENDPOINT,
-            aws_access_key_id=S3_ACCESS_KEY_ID,
-            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-            region_name=S3_REGION,
-            config=BotoConfig(
-                signature_version="s3v4",
-                s3={"addressing_style": "path"}  # <<==== FIX
-            ),
-        )
-    return _s3_client
-
-
-# ------------------------------------------------------------------------------
-# Documents
-# ------------------------------------------------------------------------------
-
-def _now_iso() -> str:
-    return datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+# ----------------- Documents (R2) --------
+def upsert_document(con: sqlite3.Connection, row: Dict[str, Any]):
+    cur = con.cursor()
+    cur.execute(
+        """
+        insert into documents (object_key, file_name, employee, doc_types,
+                               size_bytes, etag, last_modified_utc, uploaded_utc)
+        values (?,?,?,?,?,?,?,?)
+        on conflict(object_key) do update set
+           file_name=excluded.file_name,
+           employee=excluded.employee,
+           doc_types=excluded.doc_types,
+           size_bytes=excluded.size_bytes,
+           etag=excluded.etag,
+           last_modified_utc=excluded.last_modified_utc
+        """,
+        (
+            row.get("object_key"),
+            row.get("file_name"),
+            row.get("employee"),
+            row.get("doc_types"),
+            row.get("size_bytes"),
+            row.get("etag"),
+            row.get("last_modified_utc"),
+            row.get("uploaded_utc"),
+        ),
+    )
 
 @app.get("/documents")
 def documents_list(
+    q: Optional[str] = None,
     limit: int = Query(50, ge=1, le=500),
     page: int = Query(1, ge=1),
-    q: Optional[str] = None
 ):
+    offset = (page - 1) * limit
     con = connect()
     try:
-        where = "1=1"
+        base = "from documents where 1=1"
         params: List[Any] = []
         if q:
-            where += " and (file_name like ? or employee_name like ? or doc_type like ?)"
-            like = f"%{q}%"; params += [like, like, like]
-        total = con.execute(f"select count(*) as c from documents where {where}", params).fetchone()["c"]
-        offset = (page - 1) * limit
+            base += " and (file_name like ? or employee like ? or doc_types like ?)"
+            t = f"%{q}%"
+            params.extend([t, t, t])
+
+        total = con.execute(f"select count(*) {base}", params).fetchone()[0]
         rows = [dict(r) for r in con.execute(
-            f"select * from documents where {where} order by uploaded_ts desc limit ? offset ?",
+            f"select * {base} order by last_modified_utc desc, file_name limit ? offset ?",
             params + [limit, offset]
         )]
         return {"rows": rows, "page": page, "page_size": limit, "total": total}
     finally:
         con.close()
 
-@app.post("/documents/upload")
-def documents_upload(
-    employee_name: Optional[str] = None,
-    doc_type: Optional[str] = None,
-    file: UploadFile = File(...)
-):
-    if not file:
-        raise HTTPException(status_code=400, detail="file required")
-
-    # Construct key: employee/ts_filename
-    base_name = pathlib.Path(file.filename or "upload.bin").name
-    safe_emp = (employee_name or "unknown").strip().replace("/", "_")
-    stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    key = f"{safe_emp}/{stamp}__{base_name}"
-
-    try:
-        s3().upload_fileobj(
-            Fileobj=file.file,
-            Bucket=S3_BUCKET,
-            Key=key,
-            ExtraArgs={"ContentType": file.content_type or "application/octet-stream"},
-        )
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(status_code=500, detail=f"R2 upload failed: {e}")
-
-    con = connect()
-    try:
-        con.execute(
-            "insert or ignore into documents (s3_key, file_name, employee_name, doc_type, size, content_type, uploaded_ts)"
-            " values (?,?,?,?,?,?,?)",
-            (key, base_name, employee_name, doc_type, None, file.content_type, _now_iso())
-        )
-        con.commit()
-        return {"ok": True, "key": key}
-    finally:
-        con.close()
-
 @app.post("/documents/sync")
 def documents_sync():
     """
-    Read current objects in the bucket and upsert into documents table.
+    Pull the object list from R2 and mirror into the 'documents' table.
     """
-    try:
-        client = s3()
-        paginator = client.get_paginator("list_objects_v2")
-        added = 0
-        con = connect()
-        try:
-            for page in paginator.paginate(Bucket=S3_BUCKET):
-                for obj in page.get("Contents", []):
-                    key = obj["Key"]
-                    size = int(obj.get("Size") or 0)
-                    # Derive basic metadata from key (best-effort)
-                    file_name = pathlib.Path(key).name
-                    employee_name = key.split("/", 1)[0] if "/" in key else None
-                    con.execute(
-                        "insert or ignore into documents (s3_key, file_name, employee_name, doc_type, size, content_type, uploaded_ts)"
-                        " values (?,?,?,?,?,?,?)",
-                        (key, file_name, employee_name, None, size, None, _now_iso())
-                    )
-                    added += 1
-            con.commit()
-        finally:
-            con.close()
-        return {"ok": True, "added_or_seen": added}
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(status_code=500, detail=f"R2 list error: {e}")
-
-@app.get("/documents/{doc_id}/download")
-def documents_download(doc_id: int):
+    client = s3()
     con = connect()
     try:
-        row = con.execute("select * from documents where id = ?", (doc_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Not found")
-    finally:
-        con.close()
+        # list in pages
+        token = None
+        seen = 0
+        while True:
+            kw = dict(Bucket=S3_BUCKET, MaxKeys=1000)
+            if token:
+                kw["ContinuationToken"] = token
+            resp = client.list_objects_v2(**kw)
+            contents = resp.get("Contents", []) or []
+            for obj in contents:
+                key = obj.get("Key")
+                size = obj.get("Size")
+                etag = (obj.get("ETag") or "").strip('"')
+                lm = obj.get("LastModified")
+                lm_iso = lm.astimezone(datetime.timezone.utc).isoformat() if lm else None
+                file_name = key.split("/")[-1]
+                # try to parse hints from name: e.g. "Jane-Doe__Identification__...__file.pdf"
+                employee = None
+                doc_types = None
+                parts = file_name.split("__")
+                if len(parts) >= 3:
+                    employee = parts[0].replace("-", " ")
+                    doc_types = parts[1].replace("-", " ")
 
-    key = row["s3_key"]
-    try:
-        obj = s3().get_object(Bucket=S3_BUCKET, Key=key)
-        stream = obj["Body"]
-        media_type = obj.get("ContentType") or "application/octet-stream"
-        return StreamingResponse(stream, media_type=media_type,
-                                 headers={"Content-Disposition": f'inline; filename="{row["file_name"]}"'})
-    except (BotoCoreError, ClientError) as e:
-        raise HTTPException(status_code=500, detail=f"R2 get error: {e}")
+                upsert_document(con, {
+                    "object_key": key,
+                    "file_name": file_name,
+                    "employee": employee,
+                    "doc_types": doc_types,
+                    "size_bytes": size,
+                    "etag": etag,
+                    "last_modified_utc": lm_iso,
+                    "uploaded_utc": None,
+                })
+                seen += 1
 
-@app.delete("/documents/{doc_id}")
-def documents_delete(doc_id: int):
-    con = connect()
-    try:
-        row = con.execute("select * from documents where id = ?", (doc_id,)).fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Not found")
-        key = row["s3_key"]
-        try:
-            s3().delete_object(Bucket=S3_BUCKET, Key=key)
-        except (BotoCoreError, ClientError) as e:
-            raise HTTPException(status_code=500, detail=f"R2 delete error: {e}")
-        con.execute("delete from documents where id = ?", (doc_id,))
+            if resp.get("IsTruncated"):
+                token = resp.get("NextContinuationToken")
+            else:
+                break
+
         con.commit()
-        return {"ok": True}
+        return {"ok": True, "synced": seen}
+    except ClientError as e:
+        detail = getattr(e, "response", {}).get("Error", {}).get("Message") or str(e)
+        raise HTTPException(status_code=500, detail=f"R2 list error: {detail}")
     finally:
         con.close()
+
+@app.post("/documents/upload")
+async def documents_upload(
+    employee_name: str = Form(""),
+    doc_types: str = Form(""),
+    file: UploadFile = File(...),
+):
+    """
+    Upload a document to R2 and record it in the DB.
+
+    Frontend typically joins selected types with commas (e.g., "Tax Form,Identification")
+    """
+    client = s3()
+    emp_slug = slugify(employee_name)
+    types_slug = slugify(doc_types.replace(",", "-"))
+    ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    base_name = slugify(pathlib.Path(file.filename).name)
+    key = f"{emp_slug}__{types_slug}__{ts}__{base_name}".strip("_")
+
+    buf = await file.read()
+    fobj = io.BytesIO(buf)
+
+    try:
+        client.upload_fileobj(
+            fobj,
+            S3_BUCKET,
+            key,
+            ExtraArgs={"ContentType": file.content_type or "application/octet-stream"},
+        )
+    except ClientError as e:
+        detail = getattr(e, "response", {}).get("Error", {}).get("Message") or str(e)
+        raise HTTPException(status_code=500, detail=f"R2 upload error: {detail}")
+
+    # Head the object for metadata
+    try:
+        head = client.head_object(Bucket=S3_BUCKET, Key=key)
+        size = head.get("ContentLength")
+        etag = (head.get("ETag") or "").strip('"')
+        lm = head.get("LastModified")
+        lm_iso = lm.astimezone(datetime.timezone.utc).isoformat() if lm else None
+    except Exception:
+        size, etag, lm_iso = len(buf), None, None
+
+    con = connect()
+    try:
+        upsert_document(con, {
+            "object_key": key,
+            "file_name": pathlib.Path(file.filename).name,
+            "employee": employee_name.strip() or None,
+            "doc_types": doc_types.strip() or None,
+            "size_bytes": size,
+            "etag": etag,
+            "last_modified_utc": lm_iso,
+            "uploaded_utc": utcnow_iso(),
+        })
+        con.commit()
+        return {"ok": True, "key": key, "size": size}
+    finally:
+        con.close()
+
+@app.get("/documents/download")
+def documents_download(key: str):
+    """
+    Stream a document from R2 to the client (inline).
+    """
+    client = s3()
+    try:
+        obj = client.get_object(Bucket=S3_BUCKET, Key=key)
+    except ClientError as e:
+        status = getattr(e, "response", {}).get("ResponseMetadata", {}).get("HTTPStatusCode", 404)
+        raise HTTPException(status_code=status, detail="Not Found")
+
+    content_type = obj.get("ContentType") or "application/octet-stream"
+    body = obj["Body"]
+
+    return StreamingResponse(body, media_type=content_type)
+
+# --------------- Root (optional) ----------
+@app.get("/")
+def root():
+    return {"ok": True}
