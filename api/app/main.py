@@ -1,170 +1,166 @@
+from __future__ import annotations
+
 import os
-from typing import List, Dict, Any, Optional
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
-from fastapi.middleware.cors import CORSMiddleware
+import re
+import time
+from typing import List, Optional
+
 import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# -----------------------------------------------------------------------------
-# App setup
-# -----------------------------------------------------------------------------
-app = FastAPI(title="YHO Stack API")
+# ----- Config from env -----
+S3_ENDPOINT = os.getenv("S3_ENDPOINT", "").strip().rstrip("/")
+S3_REGION = os.getenv("S3_REGION", "us-east-1").strip()
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "")
+S3_BUCKET = os.getenv("S3_BUCKET", "employee-docs")
+FRONTEND_ORIGINS = [o.strip() for o in os.getenv("FRONTEND_ORIGINS", "").split(",") if o.strip()]
 
-# CORS so frontend can reach backend
+if not (S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
+    # We'll still start so health works, but endpoints will 500 with a clear message
+    pass
+
+# boto3 client configured for Supabase S3-compat endpoint
+_s3 = boto3.client(
+    "s3",
+    region_name=S3_REGION or "us-east-1",
+    endpoint_url=S3_ENDPOINT if S3_ENDPOINT.startswith("http") else f"https://{S3_ENDPOINT}",
+    aws_access_key_id=S3_ACCESS_KEY_ID,
+    aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+    config=Config(
+        s3={"addressing_style": "path"},   # Supabase expects path-style
+        retries={"max_attempts": 3, "mode": "standard"},
+        signature_version="s3v4",
+    ),
+)
+
+app = FastAPI(title="YHO Stack API (Supabase Storage)")
+
+# ----- CORS -----
+_app_origins = FRONTEND_ORIGINS or [
+    "https://yho-stack.onrender.com",
+    "https://yho-stack-1.onrender.com",
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict to ["https://yho-stack-1.onrender.com"]
+    allow_origins=_app_origins,
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
 )
 
-# -----------------------------------------------------------------------------
-# Environment variables
-# -----------------------------------------------------------------------------
-S3_ENDPOINT = (os.environ.get("S3_ENDPOINT") or "").rstrip("/")
-S3_BUCKET = os.environ.get("S3_BUCKET") or os.environ.get("R2_BUCKET") or ""
-S3_ACCESS_KEY = (
-    os.environ.get("S3_ACCESS_KEY_ID")
-    or os.environ.get("R2_ACCESS_KEY_ID")
-    or os.environ.get("AWS_ACCESS_KEY_ID")
-    or ""
-)
-S3_SECRET_KEY = (
-    os.environ.get("S3_SECRET_ACCESS_KEY")
-    or os.environ.get("R2_SECRET_ACCESS_KEY")
-    or os.environ.get("AWS_SECRET_ACCESS_KEY")
-    or ""
-)
+# ----- Helpers -----
+_slug_re = re.compile(r"[^a-z0-9]+")
+def slugify(s: str) -> str:
+    s = s.lower().strip()
+    s = _slug_re.sub("-", s)
+    return s.strip("-") or "file"
 
+def _require_storage_ready():
+    if not (S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
+        raise HTTPException(status_code=500, detail="Storage credentials not configured")
 
-# -----------------------------------------------------------------------------
-# R2 client + helpers
-# -----------------------------------------------------------------------------
-def _r2_client():
-    if not (S3_ENDPOINT and S3_BUCKET and S3_ACCESS_KEY and S3_SECRET_KEY):
-        raise RuntimeError(
-            "Missing S3/R2 env vars: S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY"
-        )
+def _ext(filename: str) -> str:
+    p = filename.rfind(".")
+    return filename[p + 1 :].lower() if p != -1 else "bin"
 
-    cfg = Config(
-        region_name="auto",
-        signature_version="s3v4",
-        s3={"addressing_style": "path"},
-        retries={"max_attempts": 3, "mode": "standard"},
-    )
+# ----- Schemas -----
+class DocRow(BaseModel):
+    key: str
+    size: int
+    last_modified: Optional[str] = None
+    url: Optional[str] = None
 
-    endpoint_url = S3_ENDPOINT
-    print(f"[r2] init endpoint_url={endpoint_url} bucket={S3_BUCKET}")
+class ListResponse(BaseModel):
+    rows: List[DocRow]
+    total: int
 
-    return boto3.client(
-        "s3",
-        aws_access_key_id=S3_ACCESS_KEY,
-        aws_secret_access_key=S3_SECRET_KEY,
-        endpoint_url=endpoint_url,
-        config=cfg,
-        verify=True,
-    )
+# ----- Health -----
+@app.get("/debug/health")
+def health():
+    return {"ok": True, "storage": bool(S3_ENDPOINT)}
 
-
-def _obj_to_row(obj: Dict[str, Any]) -> Dict[str, Any]:
-    key = obj.get("Key", "")
-    size = int(obj.get("Size") or 0)
-    last_modified = obj.get("LastModified").isoformat() if obj.get("LastModified") else None
-    base = key.rsplit("/", 1)[-1]
-    lower = base.lower()
-    doc_type: Optional[str] = None
-    if "tax" in lower:
-        doc_type = "tax"
-    elif "id" in lower or "identification" in lower:
-        doc_type = "identification"
-    elif "deposit" in lower:
-        doc_type = "direct_deposit"
-
-    return {
-        "key": key,
-        "file": base,
-        "size": size,
-        "last_modified": last_modified,
-        "doc_type": doc_type,
-    }
-
-
-# -----------------------------------------------------------------------------
-# Document endpoints
-# -----------------------------------------------------------------------------
-@app.get("/documents")
-def list_documents(
-    limit: int = Query(50, ge=1, le=1000),
-    prefix: str = Query("", description="Optional prefix to filter keys"),
-):
+# ----- List from bucket -----
+@app.get("/documents", response_model=ListResponse)
+def list_documents(prefix: str = "", limit: int = 500):
+    _require_storage_ready()
     try:
-        s3 = _r2_client()
-        resp = s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix or "", MaxKeys=limit)
-        contents = resp.get("Contents") or []
-        rows = [_obj_to_row(o) for o in contents]
-        return {"rows": rows, "limit": limit, "prefix": prefix}
-    except (ClientError, BotoCoreError) as e:
-        detail = f"R2 list error: {e}"
-        print(f"[r2] list_documents error: {detail}")
-        raise HTTPException(status_code=500, detail=detail)
+        # Paginate up to 'limit'
+        rows: List[DocRow] = []
+        kwargs = {"Bucket": S3_BUCKET, "Prefix": prefix, "MaxKeys": min(limit, 1000)}
+        resp = _s3.list_objects_v2(**kwargs)
+        while True:
+            contents = resp.get("Contents", [])
+            for obj in contents:
+                rows.append(
+                    DocRow(
+                        key=obj["Key"],
+                        size=int(obj.get("Size", 0)),
+                        last_modified=(obj.get("LastModified") or "").isoformat() if obj.get("LastModified") else None,
+                    )
+                )
+                if len(rows) >= limit:
+                    break
+            if len(rows) >= limit or not resp.get("IsTruncated"):
+                break
+            resp = _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix, ContinuationToken=resp["NextContinuationToken"], MaxKeys=min(limit - len(rows), 1000))  # type: ignore
+        return ListResponse(rows=rows, total=len(rows))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 list error: {e}")
 
-
-@app.post("/documents/sync")
-def sync_documents():
-    try:
-        s3 = _r2_client()
-        resp = s3.list_objects_v2(Bucket=S3_BUCKET, MaxKeys=1)
-        count = int(resp.get("KeyCount") or 0)
-        return {"ok": True, "sample_count": count}
-    except (ClientError, BotoCoreError) as e:
-        detail = f"R2 sync failed: {e}"
-        print(f"[r2] sync error: {detail}")
-        raise HTTPException(status_code=500, detail=detail)
-
-
-@app.post("/documents/upload")
+# ----- Upload -----
+@app.post("/documents/upload", response_model=DocRow)
 async def upload_document(
-    employee: str = Form(""),
-    doc_type: str = Form(""),
+    employee_name: str = Form(""),
+    doc_types: Optional[List[str]] = Form(default=None),
     file: UploadFile = File(...),
 ):
+    _require_storage_ready()
     try:
-        s3 = _r2_client()
-        safe_emp = (employee or "unknown").strip().replace(" ", "_")
-        safe_type = (doc_type or "misc").strip().replace(" ", "_")
-        key = f"{safe_emp}/{safe_type}/{file.filename}"
+        name_part = slugify(employee_name or "employee")
+        types_part = "-".join([slugify(t) for t in (doc_types or [])]) or "doc"
+        ts = int(time.time())
+        ext = _ext(file.filename or "bin")
+        key = f"{name_part}_{types_part}_{ts}.{ext}"
 
-        body = await file.read()
-        s3.put_object(
+        data = await file.read()
+        _s3.put_object(
             Bucket=S3_BUCKET,
             Key=key,
-            Body=body,
+            Body=data,
             ContentType=file.content_type or "application/octet-stream",
         )
-        return {"ok": True, "key": key, "size": len(body)}
-    except (ClientError, BotoCoreError) as e:
-        detail = f"R2 upload failed: {e}"
-        print(f"[r2] upload error: {detail}")
-        raise HTTPException(status_code=500, detail=detail)
+        # Make a short-lived signed URL for immediate viewing if needed
+        url = _s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=3600,
+        )
+        return DocRow(key=key, size=len(data), url=url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 upload error: {e}")
 
-
-# -----------------------------------------------------------------------------
-# Healthcheck & placeholders for other routes
-# -----------------------------------------------------------------------------
-@app.get("/debug/health")
-def healthcheck():
-    return {"ok": True, "db": True}
-
-
-@app.get("/employees")
-def get_employees(limit: int = 100):
-    # placeholder — your actual DB code goes here
-    return {"rows": [], "limit": limit}
-
-
-@app.get("/payroll/summary/payout_by_employee")
-def payroll_summary():
-    # placeholder — your actual DB code goes here
-    return {"rows": []}
+# ----- Signed download URL -----
+@app.get("/documents/signed-url", response_model=DocRow)
+def signed_url(key: str):
+    _require_storage_ready()
+    try:
+        head = _s3.head_object(Bucket=S3_BUCKET, Key=key)
+        url = _s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=3600,
+        )
+        return DocRow(
+            key=key,
+            size=int(head.get("ContentLength", 0)),
+            url=url,
+            last_modified=(head.get("LastModified") or "").isoformat() if head.get("LastModified") else None,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Not found or cannot sign: {e}")
