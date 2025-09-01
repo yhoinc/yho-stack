@@ -1,310 +1,306 @@
 "use client";
-
 import * as React from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { DataGrid, GridColDef } from "@mui/x-data-grid";
-import TextField from "@mui/material/TextField";
-import Button from "@mui/material/Button";
-import Box from "@mui/material/Box";
-import Stack from "@mui/material/Stack";
-import Typography from "@mui/material/Typography";
-import CircularProgress from "@mui/material/CircularProgress";
-import DownloadIcon from "@mui/icons-material/Download";
-import RefreshIcon from "@mui/icons-material/Refresh";
+import {
+  Box,
+  Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  IconButton,
+  Stack,
+  TextField,
+  Typography,
+} from "@mui/material";
+import { DataGrid, GridColDef, GridToolbar } from "@mui/x-data-grid";
+import EditIcon from "@mui/icons-material/Edit";
+import AddIcon from "@mui/icons-material/Add";
 
-/** If set, calls this host. Otherwise uses same origin. */
-const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/$/, "");
-
-/* ============================= Types ============================== */
-
-type NumLike = number | string;
-type StrOpt = string | null | undefined;
-
-export interface Employee {
+type Employee = {
   employee_id: string;
-  reference: StrOpt;
-  company: StrOpt;
-  location: StrOpt;
-  name: StrOpt;
-  phone: StrOpt;
-  address: StrOpt;
-  position: StrOpt;
-  labor_rate: number | null;
-  deduction: StrOpt;
-  debt: StrOpt;
-  payment_count: StrOpt;
-  apartment_id: StrOpt;
-  per_diem: number | null;
-  // tolerate extra fields without using `any`
-  [k: string]: unknown;
-}
-
-interface EmployeesEnvelope {
-  rows: Employee[];
-  total?: number;
-}
-
-/* ============================ Helpers ============================= */
-
-function apiUrl(path: string) {
-  return API_BASE ? `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}` : path;
-}
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) {
-    const msg = await res.text().catch(() => `${res.status} ${res.statusText}`);
-    throw new Error(msg);
-  }
-  return (await res.json()) as T;
-}
-
-const toText = (v: unknown): string =>
-  v === null || v === undefined ? "" : String(v);
-
-function toCurrency(n: number | null | undefined): string {
-  if (typeof n !== "number" || Number.isNaN(n)) return "";
-  return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
-}
-
-function normalizeArrayOrEnvelope(input: EmployeesEnvelope | Employee[]): Employee[] {
-  if (Array.isArray(input)) return input;
-  if (Array.isArray(input.rows)) return input.rows;
-  return [];
-}
-
-/** Build CSV (Excel compatible) */
-function makeCSV(rows: Employee[], columns: GridColDef<Employee>[]): string {
-  const header = columns.map((c) => c.headerName ?? c.field).join(",");
-  const escape = (s: string) =>
-    /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-
-  const lines = rows.map((r) =>
-    columns
-      .map((c) => {
-        const field = c.field as keyof Employee;
-        const raw = r[field];
-        let text = "";
-        if (typeof c.valueGetter === "function") {
-          // valueGetter signature: (params) => value
-          // We’ll emulate with the row only.
-          try {
-            // @ts-expect-error valueGetter generic context is fine here
-            text = toText(c.valueGetter({ row: r }));
-          } catch {
-            text = toText(raw);
-          }
-        } else if (typeof c.valueFormatter === "function") {
-          try {
-            // @ts-expect-error valueFormatter generic context is fine here
-            text = toText(c.valueFormatter({ value: raw, row: r }));
-          } catch {
-            text = toText(raw);
-          }
-        } else {
-          text = toText(raw);
-        }
-        return escape(text);
-      })
-      .join(",")
-  );
-
-  return [header, ...lines].join("\n");
-}
-
-function download(filename: string, data: string, mime = "text/csv;charset=utf-8") {
-  const blob = new Blob([data], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-}
-
-/* ============================== Page =============================== */
+  reference?: string | null;
+  company?: string | null;
+  location?: string | null;
+  name?: string | null;
+  phone?: string | null;
+  address?: string | null;
+  position?: string | null;
+  labor_rate?: number | string | null;
+  per_diem?: number | string | null;
+  deduction?: string | null;
+  debt?: string | null;
+  payment_count?: string | null;
+  apartment_id?: string | null;
+};
 
 export default function EmployeesPage() {
-  const [rows, setRows] = useState<Employee[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
+  const API = (process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000").replace(/\/$/, "");
+  const [rows, setRows] = React.useState<Employee[]>([]);
+  const [loading, setLoading] = React.useState(false);
 
-  // search (debounced)
-  const [query, setQuery] = useState("");
-  const [debounced, setDebounced] = useState("");
-  const timerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (timerRef.current) window.clearTimeout(timerRef.current);
-    timerRef.current = window.setTimeout(() => setDebounced(query), 250);
-    return () => {
-      if (timerRef.current) window.clearTimeout(timerRef.current);
-    };
+  // --- NEW: search state (with debounce) ---
+  const [query, setQuery] = React.useState("");
+  const [debounced, setDebounced] = React.useState(query);
+  React.useEffect(() => {
+    const id = window.setTimeout(() => setDebounced(query), 250);
+    return () => window.clearTimeout(id);
   }, [query]);
 
-  const load = useCallback(async () => {
-    setLoading(true);
-    setErr(null);
-    try {
-      const url = new URL(apiUrl("/employees"), window.location.href);
-      url.searchParams.set("limit", "2000");
-      const data = await getJson<EmployeesEnvelope | Employee[]>(url.toString());
-      setRows(normalizeArrayOrEnvelope(data));
-    } catch (e) {
-      setErr((e as Error).message);
-      setRows([]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const filteredRows = useMemo(() => {
+  // derive filtered rows for the grid (client-side search)
+  const filteredRows = React.useMemo(() => {
     const q = debounced.trim().toLowerCase();
     if (!q) return rows;
-
+    const toText = (v: unknown) => (v == null ? "" : String(v));
     return rows.filter((r) => {
       const bucket = [
-        toText(r.employee_id),
-        toText(r.reference),
-        toText(r.company),
-        toText(r.location),
-        toText(r.name),
-        toText(r.phone),
-        toText(r.address),
-        toText(r.position),
-        toText(r.labor_rate),
-        toText(r.deduction),
-        toText(r.debt),
-        toText(r.payment_count),
-        toText(r.apartment_id),
-        toText(r.per_diem),
+        r.employee_id,
+        r.name,
+        r.reference,
+        r.company,
+        r.location,
+        r.position,
+        r.phone,
+        r.address,
+        r.labor_rate,
+        r.per_diem,
+        r.deduction,
+        r.debt,
+        r.payment_count,
+        r.apartment_id,
       ]
+        .map(toText)
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
-
       return bucket.includes(q);
     });
   }, [rows, debounced]);
 
-  const columns = useMemo<GridColDef<Employee>[]>(() => {
-    const col = (field: keyof Employee, headerName: string, width = 140): GridColDef<Employee> => ({
-      field,
-      headerName,
-      width,
-      sortable: true,
-    });
+  const [open, setOpen] = React.useState(false);
+  const [mode, setMode] = React.useState<"create" | "edit">("create");
+  const [form, setForm] = React.useState<Partial<Employee>>({});
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
 
-    return [
-      col("employee_id", "ID", 120),
-      col("reference", "Reference", 120),
-      col("company", "Company", 140),
-      col("location", "Location", 140),
-      { field: "name", headerName: "Name", flex: 1, minWidth: 200, sortable: true },
-      col("phone", "Phone", 140),
-      { field: "address", headerName: "Address", flex: 1.2, minWidth: 220, sortable: true },
-      col("position", "Position", 140),
-      {
-        field: "labor_rate",
-        headerName: "Labor Rate",
-        width: 130,
-        sortable: true,
-        valueFormatter: (p) => toCurrency(typeof p.value === "number" ? p.value : Number(p.value)),
-      },
-      col("deduction", "Deduction", 110),
-      col("debt", "Debt", 110),
-      col("payment_count", "Payments", 110),
-      col("apartment_id", "Apt ID", 110),
-      {
-        field: "per_diem",
-        headerName: "Per Diem",
-        width: 120,
-        sortable: true,
-        valueFormatter: (p) => toCurrency(typeof p.value === "number" ? p.value : Number(p.value)),
-      },
-    ];
-  }, []);
-
-  const exportCSV = useCallback(() => {
-    if (filteredRows.length === 0) {
-      alert("No rows to export.");
-      return;
+  const fetchRows = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch(`${API}/employees?limit=2000`, { cache: "no-store" });
+      // supports either { rows: [...] } or bare [...]
+      const d = await r.json();
+      const next: Employee[] = Array.isArray(d?.rows) ? (d.rows as Employee[]) : Array.isArray(d) ? (d as Employee[]) : [];
+      setRows(next);
+    } finally {
+      setLoading(false);
     }
-    const csv = makeCSV(filteredRows, columns);
-    download(`employees_${new Date().toISOString().slice(0, 10)}.csv`, csv);
-  }, [filteredRows, columns]);
+  }, [API]);
+
+  React.useEffect(() => {
+    fetchRows();
+  }, [fetchRows]);
+
+  const moneyFmt = (p: { value: unknown }) => {
+    const n = Number(p?.value);
+    return Number.isFinite(n) ? `$${n.toFixed(2)}` : "-";
+  };
+  const numFmt = (p: { value: unknown }) => {
+    const n = Number(p?.value);
+    return Number.isFinite(n) ? n.toFixed(2) : "-";
+  };
+
+  const columns: GridColDef<Employee>[] = [
+    { field: "employee_id", headerName: "ID", minWidth: 120 },
+    { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
+    { field: "reference", headerName: "Ref", minWidth: 110 },
+    { field: "company", headerName: "Company", minWidth: 140 },
+    { field: "location", headerName: "Location", minWidth: 120 },
+    { field: "position", headerName: "Position", minWidth: 140 },
+    { field: "phone", headerName: "Phone", minWidth: 150 },
+    { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
+    {
+      field: "labor_rate",
+      headerName: "Labor Rate",
+      minWidth: 130,
+      sortable: true,
+      valueFormatter: moneyFmt,
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      sortable: false,
+      filterable: false,
+      width: 100,
+      renderCell: (params) => (
+        <IconButton size="small" onClick={() => openEdit(params.row as Employee)} aria-label="edit">
+          <EditIcon fontSize="small" />
+        </IconButton>
+      ),
+    },
+  ];
+
+  function openCreate() {
+    setMode("create");
+    setForm({
+      employee_id: "",
+      name: "",
+      reference: "",
+      company: "",
+      location: "",
+      position: "",
+      phone: "",
+      per_diem: "",
+      labor_rate: "",
+    });
+    setError(null);
+    setOpen(true);
+  }
+
+  function openEdit(emp: Employee) {
+    setMode("edit");
+    setForm({ ...emp });
+    setError(null);
+    setOpen(true);
+  }
+
+  async function save() {
+    setSaving(true);
+    try {
+      const payload: Record<string, unknown> = { ...form };
+      // coerce numerics if provided
+      payload.labor_rate =
+        payload.labor_rate === "" || payload.labor_rate == null ? null : Number(payload.labor_rate as number | string);
+      payload.per_diem =
+        payload.per_diem === "" || payload.per_diem == null ? null : Number(payload.per_diem as number | string);
+
+      if (mode === "create") {
+        if (!payload.employee_id || !payload.name) {
+          setError("Employee ID and Name are required");
+          setSaving(false);
+          return;
+        }
+        const res = await fetch(`${API}/employees`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(await res.text());
+      } else {
+        const id = String(payload.employee_id ?? "");
+        const { employee_id, ...rest } = payload;
+        const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(rest),
+        });
+        if (!res.ok) throw new Error(await res.text());
+      }
+      setOpen(false);
+      await fetchRows();
+    } catch (e) {
+      setError((e as Error).message || "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   return (
-    <Box sx={{ maxWidth: 1200, mx: "auto", p: 2 }}>
-      {/* Toolbar */}
-      <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2} sx={{ mb: 2 }}>
-        <Box>
-          <Typography component="h1" variant="h5" fontWeight={600}>
-            Employees
-          </Typography>
-          <Typography variant="body2" color="text.secondary">
-            Search, sort, and export your full employee database.
-          </Typography>
-        </Box>
-        <Stack direction="row" spacing={1}>
+    <Stack gap={2}>
+      {/* Toolbar with search + add */}
+      <Stack direction={{ xs: "column", sm: "row" }} alignItems={{ sm: "center" }} justifyContent="space-between" gap={1}>
+        <Typography variant="h5" fontWeight={600}>
+          Employees
+        </Typography>
+        <Stack direction="row" gap={1} alignItems="center">
           <TextField
             size="small"
-            placeholder="Search employees…"
+            placeholder="Search name, company, location, position…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            sx={{ width: { xs: "100%", sm: 360 } }}
           />
-          <Button
-            variant="outlined"
-            startIcon={<RefreshIcon />}
-            onClick={() => void load()}
-            disabled={loading}
-          >
-            Refresh
-          </Button>
-          <Button
-            variant="contained"
-            color="primary"
-            startIcon={<DownloadIcon />}
-            onClick={exportCSV}
-          >
-            Export CSV
+          <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+            Add Employee
           </Button>
         </Stack>
       </Stack>
 
-      {/* Status */}
-      {err ? (
-        <Box sx={{ mb: 2, color: "error.main" }}>{err}</Box>
-      ) : null}
-
-      {/* Grid */}
-      <Box sx={{ height: 720, width: "100%" }}>
-        {loading && rows.length === 0 ? (
-          <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
-            <CircularProgress />
-          </Stack>
-        ) : (
-          <DataGrid
-            rows={filteredRows.map((r, i) => ({ id: `row-${i}-${r.employee_id ?? i}`, ...r }))}
-            columns={columns}
-            disableRowSelectionOnClick
-            pageSizeOptions={[25, 50, 100, 250, 500]}
-            initialState={{
-              pagination: { paginationModel: { pageSize: 100, page: 0 } },
-              sorting: { sortModel: [{ field: "name", sort: "asc" }] },
-            }}
-            sx={{
-              "& .MuiDataGrid-columnHeaders": { backgroundColor: "rgb(248 250 252)" },
-            }}
-          />
-        )}
+      <Box sx={{ height: 640, width: "100%", bgcolor: "background.paper", borderRadius: 2, p: 1 }}>
+        <DataGrid
+          rows={filteredRows}
+          columns={columns}
+          getRowId={(r) => r.employee_id}
+          loading={loading}
+          disableRowSelectionOnClick
+          slots={{ toolbar: GridToolbar }}
+          initialState={{
+            pagination: { paginationModel: { pageSize: 25, page: 0 } },
+            sorting: { sortModel: [{ field: "name", sort: "asc" }] },
+          }}
+          pageSizeOptions={[10, 25, 50, 100]}
+        />
       </Box>
-    </Box>
+
+      <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
+        <DialogContent dividers>
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
+              gap: 2,
+              mt: 0,
+            }}
+          >
+            <TextField
+              label="Employee ID *"
+              value={form.employee_id ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, employee_id: e.target.value }))}
+              disabled={mode === "edit"}
+            />
+            <TextField label="Name *" value={form.name ?? ""} onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))} />
+            <TextField
+              label="Reference"
+              value={form.reference ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, reference: e.target.value }))}
+            />
+            <TextField label="Company" value={form.company ?? ""} onChange={(e) => setForm((p) => ({ ...p, company: e.target.value }))} />
+            <TextField
+              label="Location"
+              value={form.location ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))}
+            />
+            <TextField
+              label="Position"
+              value={form.position ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, position: e.target.value }))}
+            />
+            <TextField label="Phone" value={form.phone ?? ""} onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))} />
+            <TextField
+              label="Per Diem"
+              type="number"
+              value={form.per_diem ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, per_diem: e.target.value }))}
+            />
+            <TextField
+              label="Labor Rate"
+              type="number"
+              value={form.labor_rate ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
+            />
+          </Box>
+          {error && (
+            <Typography color="error" variant="body2" sx={{ mt: 2 }}>
+              {error}
+            </Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpen(false)}>Cancel</Button>
+          <Button onClick={save} variant="contained" disabled={saving}>
+            {saving ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
+    </Stack>
   );
 }
