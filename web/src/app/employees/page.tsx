@@ -1,282 +1,227 @@
 "use client";
-import * as React from "react";
-import {
-    Box,
-    Button,
-    Dialog,
-    DialogActions,
-    DialogContent,
-    DialogTitle,
-    IconButton,
-    Stack,
-    TextField,
-    Typography,
-} from "@mui/material";
-import { DataGrid, GridColDef, GridToolbar } from "@mui/x-data-grid";
-import EditIcon from "@mui/icons-material/Edit";
-import AddIcon from "@mui/icons-material/Add";
 
-type Employee = {
-    employee_id: string;
-    reference?: string | null;
-    company?: string | null;
-    location?: string | null;
-    name?: string | null;
-    phone?: string | null;
-    address?: string | null;
-    position?: string | null;
-    labor_rate?: number | string | null;
-    per_diem?: number | string | null;
-    deduction?: string | null;
-    debt?: string | null;
-    payment_count?: string | null;
-    apartment_id?: string | null;
-};
+import React, { useEffect, useMemo, useRef, useState } from "react";
+
+/* ============================== Config =============================== */
+
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/$/, "");
+
+/* =============================== Types =============================== */
+
+type Stringish = string | number | null | undefined;
+
+interface Employee {
+  employee_id?: number | string;
+  name?: string;
+  first_name?: string;
+  last_name?: string;
+  email?: string;
+  company?: string;
+  department?: string;
+  title?: string;
+  city?: string;
+  state?: string;
+  location?: string; // if your API provides a combined field
+  // Accept unknown extra fields without using `any`
+  [k: string]: unknown;
+}
+
+interface EmployeesEnvelope {
+  rows?: Employee[];
+  total?: number;
+}
+
+/* ============================== Helpers ============================= */
+
+function u(path: string) {
+  return API_BASE ? `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}` : path;
+}
+
+async function apiJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(await res.text().catch(() => `${res.status} ${res.statusText}`));
+  return (await res.json()) as T;
+}
+
+function coalesce(...vals: Stringish[]): string {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && `${v}`.trim() !== "") return `${v}`.trim();
+  }
+  return "";
+}
+
+function fullName(e: Employee): string {
+  return coalesce(e.name, `${coalesce(e.first_name)} ${coalesce(e.last_name)}`.trim());
+}
+
+function place(e: Employee): string {
+  return coalesce(e.location, [coalesce(e.city), coalesce(e.state)].filter(Boolean).join(", "));
+}
+
+/* ================================ UI ================================= */
 
 export default function EmployeesPage() {
-    const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-    const [rows, setRows] = React.useState<Employee[]>([]);
-    const [loading, setLoading] = React.useState(false);
+  const [rows, setRows] = useState<Employee[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
 
-    const [open, setOpen] = React.useState(false);
-    const [mode, setMode] = React.useState<"create" | "edit">("create");
-    const [form, setForm] = React.useState<Partial<Employee>>({});
-    const [saving, setSaving] = React.useState(false);
-    const [error, setError] = React.useState<string | null>(null);
+  // search (debounced)
+  const [query, setQuery] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const debounceTimer = useRef<number | null>(null);
 
-    const fetchRows = React.useCallback(async () => {
-        setLoading(true);
-        try {
-            const r = await fetch(`${API}/employees?limit=1000`);
-            const d = await r.json();
-            const raw: any[] = d?.rows ?? [];
-            setRows(raw); // trust backend values
-        } finally {
-            setLoading(false);
-        }
-    }, [API]);
-
-    React.useEffect(() => {
-        fetchRows();
-    }, [fetchRows]);
-
-    const moneyFmt = (p: any) => {
-        const v = p?.value;
-        return v == null || v === "" || Number.isNaN(Number(v))
-            ? "-"
-            : `$${Number(v).toFixed(2)}`;
+  useEffect(() => {
+    if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
+    debounceTimer.current = window.setTimeout(() => setDebounced(query), 250);
+    return () => {
+      if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
     };
-    const numFmt = (p: any) => {
-        const v = p?.value;
-        return v == null || v === "" || Number.isNaN(Number(v))
-            ? "-"
-            : Number(v).toFixed(2);
+  }, [query]);
+
+  // fetch employees
+  useEffect(() => {
+    const load = async () => {
+      setLoading(true);
+      setErr(null);
+      try {
+        const url = new URL(u("/employees"), window.location.href);
+        url.searchParams.set("limit", "2000");
+        const data = await apiJson<EmployeesEnvelope | Employee[]>(url.toString());
+        const list: Employee[] = Array.isArray(data)
+          ? data
+          : Array.isArray((data as EmployeesEnvelope).rows)
+          ? ((data as EmployeesEnvelope).rows as Employee[])
+          : [];
+        setRows(list);
+      } catch (e) {
+        setErr((e as Error).message);
+        setRows([]);
+      } finally {
+        setLoading(false);
+      }
     };
+    void load();
+  }, []);
 
-    const columns: GridColDef[] = [
-        { field: "employee_id", headerName: "ID", minWidth: 120 },
-        { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
-        { field: "reference", headerName: "Ref", minWidth: 110 },
-        { field: "company", headerName: "Company", minWidth: 140 },
-        { field: "location", headerName: "Location", minWidth: 120 },
-        { field: "position", headerName: "Position", minWidth: 140 },
-        { field: "phone", headerName: "Phone", minWidth: 150 },
-        { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
-        {
-            field: "labor_rate",
-            headerName: "Labor Rate",
-            minWidth: 130,
-            sortable: true,
-            renderCell: (params) => {
-                const v = params.row?.labor_rate ?? params.row?.pay_rate ?? null;
-                if (v == null || v === "" || Number.isNaN(Number(v))) return "-";
-                return `$${Number(v).toFixed(2)}`;
-            },
-        },
-        {
-            field: "actions",
-            headerName: "Actions",
-            sortable: false,
-            filterable: false,
-            width: 100,
-            renderCell: (params) => (
-                <IconButton size="small" onClick={() => openEdit(params.row as Employee)} aria-label="edit">
-                    <EditIcon fontSize="small" />
-                </IconButton>
-            ),
-        },
-    ];
+  // filter
+  const filtered = useMemo(() => {
+    const q = debounced.trim().toLowerCase();
+    if (!q) return rows;
 
-    function openCreate() {
-        setMode("create");
-        setForm({
-            employee_id: "",
-            name: "",
-            reference: "",
-            company: "",
-            location: "",
-            position: "",
-            phone: "",
-            per_diem: "",
-            labor_rate: "",
-        });
-        setError(null);
-        setOpen(true);
-    }
+    return rows.filter((e) => {
+      const bucket = [
+        fullName(e),
+        e.email,
+        e.title,
+        e.department,
+        e.company,
+        place(e),
+        // also let generic keys help search without using `any`
+        ...Object.entries(e)
+          .filter(([k]) => !["employee_id", "first_name", "last_name"].includes(k))
+          .map(([, v]) => (typeof v === "string" || typeof v === "number" ? `${v}` : "")),
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
 
-    function openEdit(emp: Employee) {
-        setMode("edit");
-        setForm({ ...emp });
-        setError(null);
-        setOpen(true);
-    }
+      return bucket.includes(q);
+    });
+  }, [rows, debounced]);
 
-    async function save() {
-        setSaving(true);
-        try {
-            const payload: any = { ...form };
-            // coerce numerics if provided
-            payload.labor_rate =
-                payload.labor_rate === "" || payload.labor_rate == null
-                    ? null
-                    : Number(payload.labor_rate);
-            payload.per_diem =
-                payload.per_diem === "" || payload.per_diem == null
-                    ? null
-                    : Number(payload.per_diem);
+  return (
+    <div className="mx-auto max-w-7xl p-4 space-y-6">
+      {/* Header / Toolbar */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Employees</h1>
+          <p className="text-sm text-slate-500">
+            Search by name, email, title, department, company, or location.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <input
+            className="w-72 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            placeholder="Search employees…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+        </div>
+      </div>
 
-            if (mode === "create") {
-                if (!payload.employee_id || !payload.name) {
-                    setError("Employee ID and Name are required");
-                    setSaving(false);
-                    return;
-                }
-                const res = await fetch(`${API}/employees`, {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(payload),
-                });
-                if (!res.ok) throw new Error(await res.text());
-            } else {
-                const id = payload.employee_id;
-                const { employee_id, ...rest } = payload;
-                const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
-                    method: "PATCH",
-                    headers: { "Content-Type": "application/json" },
-                    body: JSON.stringify(rest),
-                });
-                if (!res.ok) throw new Error(await res.text());
-            }
-            setOpen(false);
-            await fetchRows();
-        } catch (e: any) {
-            setError(e?.message || "Save failed");
-        } finally {
-            setSaving(false);
-        }
-    }
+      {/* Summary */}
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <div className="rounded-lg border bg-white p-4 shadow-sm">
+          <div className="text-sm text-slate-500">Total</div>
+          <div className="mt-1 text-2xl font-semibold">{rows.length}</div>
+        </div>
+        <div className="rounded-lg border bg-white p-4 shadow-sm">
+          <div className="text-sm text-slate-500">Matching</div>
+          <div className="mt-1 text-2xl font-semibold">{filtered.length}</div>
+        </div>
+        <div className="rounded-lg border bg-white p-4 shadow-sm">
+          <div className="text-sm text-slate-500">Backend</div>
+          <div className="mt-1 truncate text-slate-700">{API_BASE || "(same origin)"}</div>
+        </div>
+      </div>
 
-    return (
-        <Stack gap={2}>
-            <Stack direction="row" alignItems="center" justifyContent="space-between">
-                <Typography variant="h5" fontWeight={600}>
-                    Employees
-                </Typography>
-                <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-                    Add Employee
-                </Button>
-            </Stack>
-
-            <Box sx={{ height: 640, width: "100%", bgcolor: "background.paper", borderRadius: 2, p: 1 }}>
-                <DataGrid
-                    rows={rows}
-                    columns={columns}
-                    getRowId={(r) => r.employee_id}
-                    loading={loading}
-                    disableRowSelectionOnClick
-                    slots={{ toolbar: GridToolbar }}
-                    initialState={{
-                        pagination: { paginationModel: { pageSize: 25, page: 0 } },
-                        sorting: { sortModel: [{ field: "name", sort: "asc" }] },
-                    }}
-                    pageSizeOptions={[10, 25, 50, 100]}
-                />
-            </Box>
-
-            <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
-                <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
-                <DialogContent dividers>
-                    {/* simple 2-column responsive form without MUI Grid to avoid TS issues */}
-                    <Box
-                        sx={{
-                            display: "grid",
-                            gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
-                            gap: 2,
-                            mt: 0,
-                        }}
-                    >
-                        <TextField
-                            label="Employee ID *"
-                            value={form.employee_id ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, employee_id: e.target.value }))}
-                            disabled={mode === "edit"}
-                        />
-                        <TextField
-                            label="Name *"
-                            value={form.name ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
-                        />
-                        <TextField
-                            label="Reference"
-                            value={form.reference ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, reference: e.target.value }))}
-                        />
-                        <TextField
-                            label="Company"
-                            value={form.company ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, company: e.target.value }))}
-                        />
-                        <TextField
-                            label="Location"
-                            value={form.location ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))}
-                        />
-                        <TextField
-                            label="Position"
-                            value={form.position ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, position: e.target.value }))}
-                        />
-                        <TextField
-                            label="Phone"
-                            value={form.phone ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))}
-                        />
-                        <TextField
-                            label="Per Diem"
-                            type="number"
-                            value={form.per_diem ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, per_diem: e.target.value }))}
-                        />
-                        <TextField
-                            label="Labor Rate"
-                            type="number"
-                            value={form.labor_rate ?? ""}
-                            onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
-                        />
-                    </Box>
-                    {error && (
-                        <Typography color="error" variant="body2" sx={{ mt: 2 }}>
-                            {error}
-                        </Typography>
-                    )}
-                </DialogContent>
-                <DialogActions>
-                    <Button onClick={() => setOpen(false)}>Cancel</Button>
-                    <Button onClick={save} variant="contained" disabled={saving}>
-                        {saving ? "Saving..." : "Save"}
-                    </Button>
-                </DialogActions>
-            </Dialog>
-        </Stack>
-    );
+      {/* Table */}
+      <div className="rounded-lg border bg-white shadow-sm">
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm">
+            <thead className="bg-slate-50 text-left">
+              <tr className="text-slate-600">
+                <th className="px-4 py-3 font-medium">Name</th>
+                <th className="px-4 py-3 font-medium">Title</th>
+                <th className="px-4 py-3 font-medium">Department</th>
+                <th className="px-4 py-3 font-medium">Company</th>
+                <th className="px-4 py-3 font-medium">Email</th>
+                <th className="px-4 py-3 font-medium whitespace-nowrap">Location</th>
+              </tr>
+            </thead>
+            <tbody>
+              {loading && rows.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-6 text-slate-500" colSpan={6}>
+                    Loading…
+                  </td>
+                </tr>
+              ) : filtered.length === 0 ? (
+                <tr>
+                  <td className="px-4 py-6 text-slate-500" colSpan={6}>
+                    No employees found.
+                  </td>
+                </tr>
+              ) : (
+                filtered.map((e) => (
+                  <tr key={`${e.employee_id ?? fullName(e)}`} className="border-t">
+                    <td className="px-4 py-3">
+                      <div className="font-medium text-slate-900">{fullName(e) || "—"}</div>
+                      {e.employee_id ? (
+                        <div className="text-xs text-slate-500">ID: {e.employee_id}</div>
+                      ) : null}
+                    </td>
+                    <td className="px-4 py-3">{coalesce(e.title, "—")}</td>
+                    <td className="px-4 py-3">{coalesce(e.department, "—")}</td>
+                    <td className="px-4 py-3">{coalesce(e.company, "—")}</td>
+                    <td className="px-4 py-3">
+                      {e.email ? (
+                        <a className="text-indigo-700 hover:underline" href={`mailto:${e.email}`}>
+                          {e.email}
+                        </a>
+                      ) : (
+                        "—"
+                      )}
+                    </td>
+                    <td className="px-4 py-3 whitespace-nowrap">{place(e) || "—"}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="px-4 py-2 text-xs text-slate-500">{filtered.length} employee(s)</div>
+      </div>
+    </div>
+  );
 }
