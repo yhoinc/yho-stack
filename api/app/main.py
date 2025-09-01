@@ -35,20 +35,20 @@ if S3_ENDPOINT and S3_BUCKET:
 
 app = FastAPI(title="YHO API")
 
-# Allow both Render hosts + localhost
-allowed_origins = [
-    "https://yho-stack.onrender.com",
-    "https://yho-stack-1.onrender.com",
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
+ALLOWED_ORIGINS = [
+    "https://yho-stack-1.onrender.com",  # your Next.js app
+    "https://yho-stack.onrender.com",    # (optional) if anything makes same-origin calls
 ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=ALLOWED_ORIGINS,
+    # Also allow future / preview URLs like yho-stack-1-xxxxx.onrender.com if you ever use them:
+    allow_origin_regex=r"https://yho-stack(-\w+)?\.onrender\.com$",
+    allow_credentials=False,          # keep False unless you truly need cookies/Authorization as credentials
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],             # not required, but fine
 )
 
 # ----------------- DB helpers -------------
@@ -480,4 +480,5 @@ def health():
     except Exception:
         ok_db = False
     return {"ok": True, "db": ok_db}
+
 
