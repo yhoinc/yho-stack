@@ -333,21 +333,32 @@ async def documents_upload(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"S3 upload error: {e}")
 
+from fastapi import Response
+
 @app.get("/documents/signed-url", response_model=DocRow)
-def documents_signed_url(key: str):
+def documents_signed_url(
+    key: str,
+    disposition: str = Query("inline", pattern="^(inline|attachment)$"),
+):
+    """
+    Return a presigned URL for GET without trying HEAD first.
+    `disposition=inline|attachment` controls how the browser handles it.
+    """
     require_storage_ready()
     try:
-        head = _s3.head_object(Bucket=S3_BUCKET, Key=key)
+        params = {"Bucket": S3_BUCKET, "Key": key}
+        # Hint the browser with a filename; it’s fine if the gateway ignores it.
+        params["ResponseContentDisposition"] = f'{disposition}; filename="{key.split("/")[-1]}"'
+
         url = _s3.generate_presigned_url(
             "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": key},
-            ExpiresIn=3600,
+            Params=params,
+            ExpiresIn=600,  # 10 minutes
         )
-        return DocRow(
-            key=key,
-            size=int(head.get("ContentLength", 0)),
-            url=url,
-            last_modified=(head.get("LastModified") or "").isoformat() if head.get("LastModified") else None,
-        )
+        # We can’t know size/last_modified without HEAD; return url + key only.
+        return DocRow(key=key, size=0, url=url, last_modified=None)
     except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Not found or cannot sign: {e}")
+        # If it truly doesn't exist, the presign still succeeds, but GET will 404.
+        # We only return 404 here for obvious SDK errors.
+        raise HTTPException(status_code=500, detail=f"Could not sign URL: {e}")
+
