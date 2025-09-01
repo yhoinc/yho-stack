@@ -1,64 +1,130 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import * as React from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DataGrid, GridColDef } from "@mui/x-data-grid";
+import TextField from "@mui/material/TextField";
+import Button from "@mui/material/Button";
+import Box from "@mui/material/Box";
+import Stack from "@mui/material/Stack";
+import Typography from "@mui/material/Typography";
+import CircularProgress from "@mui/material/CircularProgress";
+import DownloadIcon from "@mui/icons-material/Download";
+import RefreshIcon from "@mui/icons-material/Refresh";
 
-/* ============================== Config =============================== */
-
+/** If set, calls this host. Otherwise uses same origin. */
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "").replace(/\/$/, "");
 
-/* =============================== Types =============================== */
+/* ============================= Types ============================== */
 
-type Stringish = string | number | null | undefined;
+type NumLike = number | string;
+type StrOpt = string | null | undefined;
 
-interface Employee {
-  employee_id?: number | string;
-  name?: string;
-  first_name?: string;
-  last_name?: string;
-  email?: string;
-  company?: string;
-  department?: string;
-  title?: string;
-  city?: string;
-  state?: string;
-  location?: string; // if your API provides a combined field
-  // Accept unknown extra fields without using `any`
+export interface Employee {
+  employee_id: string;
+  reference: StrOpt;
+  company: StrOpt;
+  location: StrOpt;
+  name: StrOpt;
+  phone: StrOpt;
+  address: StrOpt;
+  position: StrOpt;
+  labor_rate: number | null;
+  deduction: StrOpt;
+  debt: StrOpt;
+  payment_count: StrOpt;
+  apartment_id: StrOpt;
+  per_diem: number | null;
+  // tolerate extra fields without using `any`
   [k: string]: unknown;
 }
 
 interface EmployeesEnvelope {
-  rows?: Employee[];
+  rows: Employee[];
   total?: number;
 }
 
-/* ============================== Helpers ============================= */
+/* ============================ Helpers ============================= */
 
-function u(path: string) {
+function apiUrl(path: string) {
   return API_BASE ? `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}` : path;
 }
 
-async function apiJson<T>(url: string): Promise<T> {
+async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url, { cache: "no-store" });
-  if (!res.ok) throw new Error(await res.text().catch(() => `${res.status} ${res.statusText}`));
+  if (!res.ok) {
+    const msg = await res.text().catch(() => `${res.status} ${res.statusText}`);
+    throw new Error(msg);
+  }
   return (await res.json()) as T;
 }
 
-function coalesce(...vals: Stringish[]): string {
-  for (const v of vals) {
-    if (v !== undefined && v !== null && `${v}`.trim() !== "") return `${v}`.trim();
-  }
-  return "";
+const toText = (v: unknown): string =>
+  v === null || v === undefined ? "" : String(v);
+
+function toCurrency(n: number | null | undefined): string {
+  if (typeof n !== "number" || Number.isNaN(n)) return "";
+  return n.toLocaleString(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 });
 }
 
-function fullName(e: Employee): string {
-  return coalesce(e.name, `${coalesce(e.first_name)} ${coalesce(e.last_name)}`.trim());
+function normalizeArrayOrEnvelope(input: EmployeesEnvelope | Employee[]): Employee[] {
+  if (Array.isArray(input)) return input;
+  if (Array.isArray(input.rows)) return input.rows;
+  return [];
 }
 
-function place(e: Employee): string {
-  return coalesce(e.location, [coalesce(e.city), coalesce(e.state)].filter(Boolean).join(", "));
+/** Build CSV (Excel compatible) */
+function makeCSV(rows: Employee[], columns: GridColDef<Employee>[]): string {
+  const header = columns.map((c) => c.headerName ?? c.field).join(",");
+  const escape = (s: string) =>
+    /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+
+  const lines = rows.map((r) =>
+    columns
+      .map((c) => {
+        const field = c.field as keyof Employee;
+        const raw = r[field];
+        let text = "";
+        if (typeof c.valueGetter === "function") {
+          // valueGetter signature: (params) => value
+          // We’ll emulate with the row only.
+          try {
+            // @ts-expect-error valueGetter generic context is fine here
+            text = toText(c.valueGetter({ row: r }));
+          } catch {
+            text = toText(raw);
+          }
+        } else if (typeof c.valueFormatter === "function") {
+          try {
+            // @ts-expect-error valueFormatter generic context is fine here
+            text = toText(c.valueFormatter({ value: raw, row: r }));
+          } catch {
+            text = toText(raw);
+          }
+        } else {
+          text = toText(raw);
+        }
+        return escape(text);
+      })
+      .join(",")
+  );
+
+  return [header, ...lines].join("\n");
 }
 
-/* ================================ UI ================================= */
+function download(filename: string, data: string, mime = "text/csv;charset=utf-8") {
+  const blob = new Blob([data], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/* ============================== Page =============================== */
 
 export default function EmployeesPage() {
   const [rows, setRows] = useState<Employee[]>([]);
@@ -68,58 +134,56 @@ export default function EmployeesPage() {
   // search (debounced)
   const [query, setQuery] = useState("");
   const [debounced, setDebounced] = useState("");
-  const debounceTimer = useRef<number | null>(null);
+  const timerRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
-    debounceTimer.current = window.setTimeout(() => setDebounced(query), 250);
+    if (timerRef.current) window.clearTimeout(timerRef.current);
+    timerRef.current = window.setTimeout(() => setDebounced(query), 250);
     return () => {
-      if (debounceTimer.current) window.clearTimeout(debounceTimer.current);
+      if (timerRef.current) window.clearTimeout(timerRef.current);
     };
   }, [query]);
 
-  // fetch employees
-  useEffect(() => {
-    const load = async () => {
-      setLoading(true);
-      setErr(null);
-      try {
-        const url = new URL(u("/employees"), window.location.href);
-        url.searchParams.set("limit", "2000");
-        const data = await apiJson<EmployeesEnvelope | Employee[]>(url.toString());
-        const list: Employee[] = Array.isArray(data)
-          ? data
-          : Array.isArray((data as EmployeesEnvelope).rows)
-          ? ((data as EmployeesEnvelope).rows as Employee[])
-          : [];
-        setRows(list);
-      } catch (e) {
-        setErr((e as Error).message);
-        setRows([]);
-      } finally {
-        setLoading(false);
-      }
-    };
-    void load();
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const url = new URL(apiUrl("/employees"), window.location.href);
+      url.searchParams.set("limit", "2000");
+      const data = await getJson<EmployeesEnvelope | Employee[]>(url.toString());
+      setRows(normalizeArrayOrEnvelope(data));
+    } catch (e) {
+      setErr((e as Error).message);
+      setRows([]);
+    } finally {
+      setLoading(false);
+    }
   }, []);
 
-  // filter
-  const filtered = useMemo(() => {
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const filteredRows = useMemo(() => {
     const q = debounced.trim().toLowerCase();
     if (!q) return rows;
 
-    return rows.filter((e) => {
+    return rows.filter((r) => {
       const bucket = [
-        fullName(e),
-        e.email,
-        e.title,
-        e.department,
-        e.company,
-        place(e),
-        // also let generic keys help search without using `any`
-        ...Object.entries(e)
-          .filter(([k]) => !["employee_id", "first_name", "last_name"].includes(k))
-          .map(([, v]) => (typeof v === "string" || typeof v === "number" ? `${v}` : "")),
+        toText(r.employee_id),
+        toText(r.reference),
+        toText(r.company),
+        toText(r.location),
+        toText(r.name),
+        toText(r.phone),
+        toText(r.address),
+        toText(r.position),
+        toText(r.labor_rate),
+        toText(r.deduction),
+        toText(r.debt),
+        toText(r.payment_count),
+        toText(r.apartment_id),
+        toText(r.per_diem),
       ]
         .filter(Boolean)
         .join(" ")
@@ -129,99 +193,118 @@ export default function EmployeesPage() {
     });
   }, [rows, debounced]);
 
+  const columns = useMemo<GridColDef<Employee>[]>(() => {
+    const col = (field: keyof Employee, headerName: string, width = 140): GridColDef<Employee> => ({
+      field,
+      headerName,
+      width,
+      sortable: true,
+    });
+
+    return [
+      col("employee_id", "ID", 120),
+      col("reference", "Reference", 120),
+      col("company", "Company", 140),
+      col("location", "Location", 140),
+      { field: "name", headerName: "Name", flex: 1, minWidth: 200, sortable: true },
+      col("phone", "Phone", 140),
+      { field: "address", headerName: "Address", flex: 1.2, minWidth: 220, sortable: true },
+      col("position", "Position", 140),
+      {
+        field: "labor_rate",
+        headerName: "Labor Rate",
+        width: 130,
+        sortable: true,
+        valueFormatter: (p) => toCurrency(typeof p.value === "number" ? p.value : Number(p.value)),
+      },
+      col("deduction", "Deduction", 110),
+      col("debt", "Debt", 110),
+      col("payment_count", "Payments", 110),
+      col("apartment_id", "Apt ID", 110),
+      {
+        field: "per_diem",
+        headerName: "Per Diem",
+        width: 120,
+        sortable: true,
+        valueFormatter: (p) => toCurrency(typeof p.value === "number" ? p.value : Number(p.value)),
+      },
+    ];
+  }, []);
+
+  const exportCSV = useCallback(() => {
+    if (filteredRows.length === 0) {
+      alert("No rows to export.");
+      return;
+    }
+    const csv = makeCSV(filteredRows, columns);
+    download(`employees_${new Date().toISOString().slice(0, 10)}.csv`, csv);
+  }, [filteredRows, columns]);
+
   return (
-    <div className="mx-auto max-w-7xl p-4 space-y-6">
-      {/* Header / Toolbar */}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">Employees</h1>
-          <p className="text-sm text-slate-500">
-            Search by name, email, title, department, company, or location.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <input
-            className="w-72 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+    <Box sx={{ maxWidth: 1200, mx: "auto", p: 2 }}>
+      {/* Toolbar */}
+      <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={2} sx={{ mb: 2 }}>
+        <Box>
+          <Typography component="h1" variant="h5" fontWeight={600}>
+            Employees
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            Search, sort, and export your full employee database.
+          </Typography>
+        </Box>
+        <Stack direction="row" spacing={1}>
+          <TextField
+            size="small"
             placeholder="Search employees…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
           />
-        </div>
-      </div>
+          <Button
+            variant="outlined"
+            startIcon={<RefreshIcon />}
+            onClick={() => void load()}
+            disabled={loading}
+          >
+            Refresh
+          </Button>
+          <Button
+            variant="contained"
+            color="primary"
+            startIcon={<DownloadIcon />}
+            onClick={exportCSV}
+          >
+            Export CSV
+          </Button>
+        </Stack>
+      </Stack>
 
-      {/* Summary */}
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <div className="rounded-lg border bg-white p-4 shadow-sm">
-          <div className="text-sm text-slate-500">Total</div>
-          <div className="mt-1 text-2xl font-semibold">{rows.length}</div>
-        </div>
-        <div className="rounded-lg border bg-white p-4 shadow-sm">
-          <div className="text-sm text-slate-500">Matching</div>
-          <div className="mt-1 text-2xl font-semibold">{filtered.length}</div>
-        </div>
-        <div className="rounded-lg border bg-white p-4 shadow-sm">
-          <div className="text-sm text-slate-500">Backend</div>
-          <div className="mt-1 truncate text-slate-700">{API_BASE || "(same origin)"}</div>
-        </div>
-      </div>
+      {/* Status */}
+      {err ? (
+        <Box sx={{ mb: 2, color: "error.main" }}>{err}</Box>
+      ) : null}
 
-      {/* Table */}
-      <div className="rounded-lg border bg-white shadow-sm">
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
-            <thead className="bg-slate-50 text-left">
-              <tr className="text-slate-600">
-                <th className="px-4 py-3 font-medium">Name</th>
-                <th className="px-4 py-3 font-medium">Title</th>
-                <th className="px-4 py-3 font-medium">Department</th>
-                <th className="px-4 py-3 font-medium">Company</th>
-                <th className="px-4 py-3 font-medium">Email</th>
-                <th className="px-4 py-3 font-medium whitespace-nowrap">Location</th>
-              </tr>
-            </thead>
-            <tbody>
-              {loading && rows.length === 0 ? (
-                <tr>
-                  <td className="px-4 py-6 text-slate-500" colSpan={6}>
-                    Loading…
-                  </td>
-                </tr>
-              ) : filtered.length === 0 ? (
-                <tr>
-                  <td className="px-4 py-6 text-slate-500" colSpan={6}>
-                    No employees found.
-                  </td>
-                </tr>
-              ) : (
-                filtered.map((e) => (
-                  <tr key={`${e.employee_id ?? fullName(e)}`} className="border-t">
-                    <td className="px-4 py-3">
-                      <div className="font-medium text-slate-900">{fullName(e) || "—"}</div>
-                      {e.employee_id ? (
-                        <div className="text-xs text-slate-500">ID: {e.employee_id}</div>
-                      ) : null}
-                    </td>
-                    <td className="px-4 py-3">{coalesce(e.title, "—")}</td>
-                    <td className="px-4 py-3">{coalesce(e.department, "—")}</td>
-                    <td className="px-4 py-3">{coalesce(e.company, "—")}</td>
-                    <td className="px-4 py-3">
-                      {e.email ? (
-                        <a className="text-indigo-700 hover:underline" href={`mailto:${e.email}`}>
-                          {e.email}
-                        </a>
-                      ) : (
-                        "—"
-                      )}
-                    </td>
-                    <td className="px-4 py-3 whitespace-nowrap">{place(e) || "—"}</td>
-                  </tr>
-                ))
-              )}
-            </tbody>
-          </table>
-        </div>
-        <div className="px-4 py-2 text-xs text-slate-500">{filtered.length} employee(s)</div>
-      </div>
-    </div>
+      {/* Grid */}
+      <Box sx={{ height: 720, width: "100%" }}>
+        {loading && rows.length === 0 ? (
+          <Stack alignItems="center" justifyContent="center" sx={{ height: "100%" }}>
+            <CircularProgress />
+          </Stack>
+        ) : (
+          <DataGrid
+            rows={filteredRows.map((r, i) => ({ id: `row-${i}-${r.employee_id ?? i}`, ...r }))}
+            columns={columns}
+            disableRowSelectionOnClick
+            pageSizeOptions={[25, 50, 100, 250, 500]}
+            initialState={{
+              pagination: { paginationModel: { pageSize: 100, page: 0 } },
+              sorting: { sortModel: [{ field: "name", sort: "asc" }] },
+            }}
+            sx={{
+              "& .MuiDataGrid-columnHeaders": { backgroundColor: "rgb(248 250 252)" },
+            }}
+          />
+        )}
+      </Box>
+    </Box>
   );
 }
