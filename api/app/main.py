@@ -1,364 +1,285 @@
-from __future__ import annotations
-
 import os
-import re
+import io
+import json
 import sqlite3
-import time
-from contextlib import contextmanager
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, PlainTextResponse
 
 import boto3
-from botocore.config import Config
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from botocore.client import Config
+from botocore.exceptions import ClientError
 
-# =========================================================
-# -------------------- Environment ------------------------
-# =========================================================
-
-# --- DB (SQLite) ---
+# -----------------------------------------------------------------------------
+# Config / paths
+# -----------------------------------------------------------------------------
 DATA_DIR = os.getenv("DATA_DIR", "/data")
-DB_PATH = os.getenv("DB_PATH", os.path.join(DATA_DIR, "employees_with_company_v2.db"))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_FILE = os.getenv("DB_FILE", "employees_with_company_v2.db")
+DB_PATH = os.path.join(DATA_DIR, DB_FILE)
 
-# --- Supabase S3-compatible storage (for documents) ---
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "").strip().rstrip("/")
-S3_REGION = os.getenv("S3_REGION", "us-east-1").strip() or "us-east-1"
-S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "")
-S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "")
+S3_ENDPOINT = (os.getenv("S3_ENDPOINT") or "").strip()
+S3_REGION = os.getenv("S3_REGION", "us-east-1")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
 S3_BUCKET = os.getenv("S3_BUCKET", "employee-docs")
 
-# --- CORS ---
-FRONTEND_ORIGINS = [
-    o.strip()
-    for o in os.getenv("FRONTEND_ORIGINS", "").split(",")
-    if o.strip()
-] or [
-    "https://yho-stack.onrender.com",
-    "https://yho-stack-1.onrender.com",
-]
+# Supabase “S3 via HTTP” endpoints are HTTPS—boto3 wants a hostname without scheme.
+def normalize_endpoint(ep: str) -> str:
+    ep = ep.strip()
+    if ep.startswith("https://"):
+        ep = ep[len("https://") :]
+    if ep.startswith("http://"):
+        ep = ep[len("http://") :]
+    return ep
 
-# =========================================================
-# -------------------- FastAPI app ------------------------
-# =========================================================
+S3_HOST = normalize_endpoint(S3_ENDPOINT) if S3_ENDPOINT else ""
 
-app = FastAPI(title="YHO Stack API (Employees, Payroll, Documents)")
+def s3_client():
+    if not (S3_HOST and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
+        raise RuntimeError("S3 credentials/endpoint are not fully configured.")
+    return boto3.client(
+        "s3",
+        region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY_ID,
+        aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+        endpoint_url=f"https://{S3_HOST}",
+        config=Config(s3={"addressing_style": "path"}),
+    )
+
+# -----------------------------------------------------------------------------
+# FastAPI app + CORS
+# -----------------------------------------------------------------------------
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS,
+    allow_origins=["*"],           # Render + your Next.js app(s)
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition"],
     max_age=600,
 )
 
-# =========================================================
-# ---------------------- SQLite ---------------------------
-# =========================================================
+# -----------------------------------------------------------------------------
+# SQLite helpers (robust to table name differences)
+# -----------------------------------------------------------------------------
+EMPLOYEE_LIKE_COLUMNS = {
+    "employee_id",
+    "name",
+    "reference",
+    "company",
+    "location",
+    "position",
+    "phone",
+    "address",
+    "labor_rate",
+    "per_diem",
+    "deduction",
+    "debt",
+    "payment_count",
+    "apartment_id",
+}
 
-def db_exists(path: str) -> bool:
-    try:
-        return os.path.exists(path) and os.path.getsize(path) > 0
-    except Exception:
-        return False
-
-@contextmanager
-def db_conn(path: str) -> Iterable[sqlite3.Connection]:
-    if not db_exists(path):
-        raise HTTPException(status_code=500, detail=f"DB not found at {path}")
-    conn = sqlite3.connect(path)
+def open_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    return conn
+
+def discover_employee_table(conn: sqlite3.Connection) -> Tuple[str, List[str]]:
+    """
+    Find a table containing an 'employee_id' column. Return (table_name, column_names).
+    Raises if none found.
+    """
+    cur = conn.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+    candidates: List[Tuple[str, List[str]]] = []
+    for row in cur.fetchall():
+        tname: str = row["name"]
+        # columns for this table
+        cols = [r["name"] for r in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
+        if "employee_id" in cols:
+            candidates.append((tname, cols))
+    if not candidates:
+        raise RuntimeError("No table with an 'employee_id' column was found in the database.")
+    # Prefer common names if multiple
+    preferred = ["employees", "employee", "staff", "people", "workers"]
+    for pref in preferred:
+        for tname, cols in candidates:
+            if tname.lower() == pref:
+                return tname, cols
+    return candidates[0]
+
+def dict_from_row(row: sqlite3.Row) -> Dict[str, Any]:
+    return {k: row[k] for k in row.keys()}
+
+def filter_employee_payload(payload: Dict[str, Any], table_columns: List[str]) -> Dict[str, Any]:
+    """
+    Only keep columns that exist in the target table; coerce numeric-like fields if present.
+    """
+    keep = {}
+    for key, val in payload.items():
+        if key in table_columns:
+            if key in ("labor_rate", "per_diem") and val not in (None, ""):
+                try:
+                    keep[key] = float(val)
+                except Exception:
+                    keep[key] = None
+            else:
+                keep[key] = val
+    return keep
+
+# -----------------------------------------------------------------------------
+# Employees API
+# -----------------------------------------------------------------------------
+@app.get("/employees")
+def list_employees(limit: int = Query(1000, ge=1, le=10000), offset: int = Query(0, ge=0)):
     try:
-        yield conn
-    finally:
-        conn.close()
-
-def table_exists(conn: sqlite3.Connection, name: str) -> bool:
-    cur = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=lower(?)",
-        (name,),
-    )
-    return cur.fetchone() is not None
-
-def pick_first_existing_table(conn: sqlite3.Connection, candidates: List[str]) -> Optional[str]:
-    for t in candidates:
-        if table_exists(conn, t):
-            return t
-    return None
-
-def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> List[Dict[str, Any]]:
-    return [dict(r) for r in rows]
-
-# =========================================================
-# --------------------- Storage (S3) ----------------------
-# =========================================================
-
-def storage_ready() -> bool:
-    return bool(S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET)
-
-def require_storage_ready():
-    if not storage_ready():
-        raise HTTPException(status_code=500, detail="Storage credentials not configured")
-
-_s3 = boto3.client(
-    "s3",
-    region_name=S3_REGION,
-    endpoint_url=S3_ENDPOINT if S3_ENDPOINT.startswith("http") else (f"https://{S3_ENDPOINT}" if S3_ENDPOINT else None),
-    aws_access_key_id=S3_ACCESS_KEY_ID or None,
-    aws_secret_access_key=S3_SECRET_ACCESS_KEY or None,
-    config=Config(
-        s3={"addressing_style": "path"},
-        retries={"max_attempts": 3, "mode": "standard"},
-        signature_version="s3v4",
-    ),
-)
-
-_slug_re = re.compile(r"[^a-z0-9]+")
-def slugify(s: str) -> str:
-    s = s.lower().strip()
-    s = _slug_re.sub("-", s)
-    return s.strip("-") or "file"
-
-def file_ext(filename: str) -> str:
-    p = filename.rfind(".")
-    return filename[p + 1 :].lower() if p != -1 else "bin"
-
-# =========================================================
-# --------------------- Pydantic models -------------------
-# =========================================================
-
-class HealthOut(BaseModel):
-    ok: bool
-    db: bool
-    storage: bool
-
-class PageOut(BaseModel):
-    rows: List[Dict[str, Any]]
-    page: int
-    page_size: int
-    total: int
-
-class DocRow(BaseModel):
-    key: str
-    size: int
-    last_modified: Optional[str] = None
-    url: Optional[str] = None
-
-class DocList(BaseModel):
-    rows: List[DocRow]
-    total: int
-
-# =========================================================
-# ------------------------- Routes ------------------------
-# =========================================================
-
-@app.get("/debug/health", response_model=HealthOut)
-def debug_health():
-    return HealthOut(ok=True, db=db_exists(DB_PATH), storage=storage_ready())
-
-# --------------- Employees -----------------
-
-@app.get("/employees", response_model=PageOut)
-def list_employees(
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=1000),
-    q: Optional[str] = Query(None, description="Search text"),
-):
-    """
-    Defensive implementation that works with a few likely table shapes.
-    We try to find an employees-like table and do a simple (optional) text search.
-    """
-    with db_conn(DB_PATH) as conn:
-        # Guess a table to read from
-        table = pick_first_existing_table(
-            conn,
-            [
-                "employees",
-                "employee",
-                "vw_employees",
-                "employee_view",
-            ],
-        )
-        if not table:
-            # Fall back: list all tables to aid debugging
-            tbls = rows_to_dicts(conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"))
-            raise HTTPException(
-                status_code=404,
-                detail=f"No employees table found. Existing tables: {[t['name'] for t in tbls]}",
-            )
-
-        # Determine columns to select (avoid huge SELECT *)
-        cols = rows_to_dicts(
-            conn.execute(f"PRAGMA table_info('{table}')")
-        )
-        col_names = [c["name"] for c in cols] or ["*"]
-        select_cols = ", ".join([f'"{c}"' for c in col_names])
-
-        where = ""
-        args: List[Any] = []
-        if q:
-            # Try friendly columns if present
-            like_cols = [c for c in ["full_name", "first_name", "last_name", "name"] if c in col_names]
-            if like_cols:
-                like_bits = " OR ".join([f'LOWER("{c}") LIKE ?' for c in like_cols])
-                where = f" WHERE {like_bits} "
-                args.extend([f"%{q.lower()}%"] * len(like_cols))
-
-        # Get total
-        total_sql = f"SELECT COUNT(1) AS cnt FROM '{table}'{where}"
-        total = conn.execute(total_sql, args).fetchone()["cnt"]
-
-        # Page
-        offset = (page - 1) * limit
-        data_sql = f"SELECT {select_cols} FROM '{table}'{where} ORDER BY rowid LIMIT ? OFFSET ?"
-        rows = rows_to_dicts(conn.execute(data_sql, (*args, limit, offset)).fetchall())
-
-        return PageOut(rows=rows, page=page, page_size=limit, total=int(total))
-
-# --------------- Payroll (summary) ---------------
-
-@app.get("/payroll/summary/payout_by_employee", response_model=PageOut)
-def payroll_summary(limit: int = Query(500, ge=1, le=5000)):
-    """
-    Returns aggregated payout by employee if a plausible payroll table exists.
-    Tries common table/column names, and degrades gracefully if not found.
-    """
-    with db_conn(DB_PATH) as conn:
-        # Try to locate a payroll/payments table
-        payroll_table = pick_first_existing_table(
-            conn,
-            ["payroll", "payments", "employee_payments", "vw_payroll"],
-        )
-        if not payroll_table:
-            raise HTTPException(status_code=404, detail="No payroll table found")
-
-        # Find likely columns
-        cols = rows_to_dicts(conn.execute(f"PRAGMA table_info('{payroll_table}')"))
-        names = {c["name"].lower() for c in cols}
-
-        # Guess amount and employee id/name columns
-        amount_col = next((c for c in ["amount", "net_pay", "payout", "pay"] if c in names), None)
-        emp_id_col = next((c for c in ["employee_id", "emp_id", "id_employee"] if c in names), None)
-        emp_name_col = next((c for c in ["employee_name", "full_name", "name"] if c in names), None)
-
-        if not amount_col or not (emp_id_col or emp_name_col):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot infer columns in {payroll_table}. Need amount + employee id/name.",
-            )
-
-        # Build group-by
-        if emp_name_col:
-            group_expr = f'"{emp_name_col}"'
-            select_label = "employee"
-        else:
-            group_expr = f'"{emp_id_col}"'
-            select_label = "employee_id"
-
-        sql = f"""
-            SELECT {group_expr} AS {select_label}, SUM("{amount_col}") AS total_payout
-            FROM "{payroll_table}"
-            GROUP BY {group_expr}
-            ORDER BY total_payout DESC
-            LIMIT ?
-        """
-        rows = rows_to_dicts(conn.execute(sql, (limit,)).fetchall())
-
-        # Normalize return shape
-        return PageOut(rows=rows, page=1, page_size=limit, total=len(rows))
-
-# --------------- Documents (Supabase Storage via S3) ---------------
-
-class DocUploadOut(DocRow):
-    pass
-
-@app.get("/documents", response_model=DocList)
-def documents_list(prefix: str = "", limit: int = Query(500, ge=1, le=1000)):
-    require_storage_ready()
-    try:
-        rows: List[DocRow] = []
-        resp = _s3.list_objects_v2(Bucket=S3_BUCKET, Prefix=prefix or "", MaxKeys=min(limit, 1000))
-        while True:
-            for obj in resp.get("Contents", []):
-                rows.append(
-                    DocRow(
-                        key=obj["Key"],
-                        size=int(obj.get("Size", 0)),
-                        last_modified=(obj.get("LastModified") or "").isoformat() if obj.get("LastModified") else None,
-                    )
-                )
-                if len(rows) >= limit:
-                    break
-            if len(rows) >= limit or not resp.get("IsTruncated"):
-                break
-            resp = _s3.list_objects_v2(
-                Bucket=S3_BUCKET,
-                Prefix=prefix or "",
-                ContinuationToken=resp["NextContinuationToken"],
-                MaxKeys=min(limit - len(rows), 1000),
-            )
-        return DocList(rows=rows, total=len(rows))
+        with open_db() as conn:
+            tname, cols = discover_employee_table(conn)
+            total = conn.execute(f"SELECT COUNT(*) AS c FROM '{tname}'").fetchone()["c"]
+            rows = conn.execute(
+                f"SELECT * FROM '{tname}' LIMIT ? OFFSET ?", (limit, offset)
+            ).fetchall()
+            data = [dict_from_row(r) for r in rows]
+            return {"rows": data, "total": total, "limit": limit, "offset": offset, "table": tname}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"S3 list error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/documents/upload", response_model=DocUploadOut)
-async def documents_upload(
+@app.post("/employees")
+def create_employee(payload: Dict[str, Any]):
+    if not isinstance(payload, dict) or not payload.get("employee_id"):
+        raise HTTPException(status_code=400, detail="employee_id is required")
+    try:
+        with open_db() as conn:
+            tname, cols = discover_employee_table(conn)
+            # keep only existing columns
+            data = filter_employee_payload(payload, cols)
+            # Build INSERT
+            keys = list(data.keys())
+            qmarks = ",".join(["?"] * len(keys))
+            sql = f"INSERT INTO '{tname}' ({','.join(keys)}) VALUES ({qmarks})"
+            conn.execute(sql, tuple(data[k] for k in keys))
+            conn.commit()
+            return {"ok": True}
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.patch("/employees/{employee_id}")
+def update_employee(employee_id: str, payload: Dict[str, Any]):
+    if not employee_id:
+        raise HTTPException(status_code=400, detail="employee_id is required")
+    try:
+        with open_db() as conn:
+            tname, cols = discover_employee_table(conn)
+            data = filter_employee_payload(payload, cols)
+            if not data:
+                return {"ok": True, "updated": 0}
+            sets = ", ".join([f"{k}=?" for k in data.keys()])
+            sql = f"UPDATE '{tname}' SET {sets} WHERE employee_id=?"
+            cur = conn.execute(sql, (*[data[k] for k in data.keys()], employee_id))
+            conn.commit()
+            if cur.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Employee not found")
+            return {"ok": True, "updated": cur.rowcount}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# -----------------------------------------------------------------------------
+# Documents (S3-compatible – e.g., Supabase Storage S3)
+# -----------------------------------------------------------------------------
+def require_s3():
+    try:
+        return s3_client()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"S3 not configured: {e}")
+
+@app.get("/documents")
+def list_documents(limit: int = 500):
+    """
+    Return flat listing of objects in S3_BUCKET (key, size, last_modified).
+    """
+    s3 = require_s3()
+    try:
+        paginator = s3.get_paginator("list_objects_v2")
+        page_it = paginator.paginate(Bucket=S3_BUCKET, PaginationConfig={"MaxItems": limit})
+        items: List[Dict[str, Any]] = []
+        for page in page_it:
+            for obj in page.get("Contents", []) or []:
+                items.append(
+                    {
+                        "key": obj["Key"],
+                        "size": obj.get("Size", 0),
+                        "last_modified": obj.get("LastModified").isoformat() if obj.get("LastModified") else None,
+                    }
+                )
+                if len(items) >= limit:
+                    break
+            if len(items) >= limit:
+                break
+        return {"rows": items, "total": len(items)}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/documents/upload")
+async def upload_document(
     employee_name: str = Form(""),
-    doc_types: Optional[List[str]] = Form(default=None),
+    doc_types: str = Form(""),
+    custom_type: str = Form(""),
     file: UploadFile = File(...),
 ):
-    require_storage_ready()
-    try:
-        name_part = slugify(employee_name or "employee")
-        types_part = "-".join([slugify(t) for t in (doc_types or [])]) or "doc"
-        ts = int(time.time())
-        ext = file_ext(file.filename or "bin")
-        key = f"{name_part}_{types_part}_{ts}.{ext}"
-
-        data = await file.read()
-        _s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=key,
-            Body=data,
-            ContentType=file.content_type or "application/octet-stream",
-        )
-        url = _s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": key},
-            ExpiresIn=3600,
-        )
-        return DocUploadOut(key=key, size=len(data), url=url)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"S3 upload error: {e}")
-
-from fastapi import Response
-
-@app.get("/documents/signed-url", response_model=DocRow)
-def documents_signed_url(
-    key: str,
-    disposition: str = Query("inline", pattern="^(inline|attachment)$"),
-):
     """
-    Return a presigned URL for GET without trying HEAD first.
-    `disposition=inline|attachment` controls how the browser handles it.
+    Upload file -> S3. Key format:
+    {sanitized_name}/{type_or_custom}/{original_filename}
     """
-    require_storage_ready()
+    s3 = require_s3()
     try:
-        params = {"Bucket": S3_BUCKET, "Key": key}
-        # Hint the browser with a filename; it’s fine if the gateway ignores it.
-        params["ResponseContentDisposition"] = f'{disposition}; filename="{key.split("/")[-1]}"'
+        name = (employee_name or "unknown").strip() or "unknown"
+        name_key = "_".join(name.split())
+        chosen_type = (custom_type or doc_types or "misc").strip() or "misc"
 
-        url = _s3.generate_presigned_url(
-            "get_object",
-            Params=params,
-            ExpiresIn=600,  # 10 minutes
-        )
-        # We can’t know size/last_modified without HEAD; return url + key only.
-        return DocRow(key=key, size=0, url=url, last_modified=None)
+        original = file.filename or "upload.bin"
+        key = f"{name_key}/{chosen_type}/{original}"
+
+        body = await file.read()
+        s3.put_object(Bucket=S3_BUCKET, Key=key, Body=body, ContentType=file.content_type or "application/octet-stream")
+        return {"ok": True, "key": key}
+    except ClientError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/documents/{key:path}/download")
+def download_document(key: str):
+    s3 = require_s3()
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
+        content_type = obj.get("ContentType") or "application/octet-stream"
+        stream = obj["Body"].read()
+        return StreamingResponse(io.BytesIO(stream), media_type=content_type,
+                                 headers={"Content-Disposition": f'inline; filename="{os.path.basename(key)}"'})
+    except ClientError as e:
+        code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
+        raise HTTPException(status_code=code, detail=str(e))
+
+@app.post("/documents/sync")
+def sync_documents():
+    """
+    Placeholder: In a future step, you can sync S3 keys into a DB table.
+    For now, just return ok so the button doesn't 500.
+    """
+    return {"ok": True}
+
+# -----------------------------------------------------------------------------
+# Health / debug
+# -----------------------------------------------------------------------------
+@app.get("/debug/health")
+def health():
+    try:
+        ok_db = os.path.exists(DB_PATH)
+        return {"ok": True, "db": ok_db, "db_path": DB_PATH}
     except Exception as e:
-        # If it truly doesn't exist, the presign still succeeds, but GET will 404.
-        # We only return 404 here for obvious SDK errors.
-        raise HTTPException(status_code=500, detail=f"Could not sign URL: {e}")
-
+        return PlainTextResponse(str(e), status_code=500)
