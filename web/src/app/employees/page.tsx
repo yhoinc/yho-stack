@@ -26,6 +26,12 @@ type Employee = {
   address?: string | null;
   position?: string | null;
   labor_rate?: number | string | null;
+  // fallback keys we may see from older data or other DBs
+  pay_rate?: number | string | null;
+  payrate?: number | string | null;
+  rate?: number | string | null;
+  hourly_rate?: number | string | null;
+
   per_diem?: number | string | null;
   deduction?: string | null;
   debt?: string | null;
@@ -34,15 +40,14 @@ type Employee = {
 };
 
 export default function EmployeesPage() {
-  // ——— IMPORTANT: this should be set in Render to https://yho-stack.onrender.com ———
   const ENV_API = process.env.NEXT_PUBLIC_API_BASE || "";
-  const API = ENV_API.replace(/\/$/, ""); // trim trailing slash
+  const API = ENV_API.replace(/\/$/, "");
 
   const [rows, setRows] = React.useState<Employee[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [loadError, setLoadError] = React.useState<string | null>(null);
 
-  // search (debounced)
+  // search
   const [query, setQuery] = React.useState("");
   const [debounced, setDebounced] = React.useState(query);
   React.useEffect(() => {
@@ -64,12 +69,9 @@ export default function EmployeesPage() {
         r.position,
         r.phone,
         r.address,
-        r.labor_rate,
-        r.per_diem,
-        r.deduction,
-        r.debt,
-        r.payment_count,
-        r.apartment_id,
+        // searchable versions of rate/per-diem too
+        getRate(r)?.toString() ?? "",
+        getPerDiem(r)?.toString() ?? "",
       ]
         .map(toText)
         .join(" ")
@@ -78,44 +80,59 @@ export default function EmployeesPage() {
     });
   }, [rows, debounced]);
 
+  // ---- helpers to normalize data coming from API ----
+  function num(v: unknown): number | null {
+    if (v === null || v === undefined) return null;
+    const s = String(v).replace(/[$,]/g, "");
+    const n = Number(s);
+    return Number.isFinite(n) ? n : null;
+  }
+  function getRate(r: Employee): number | null {
+    return (
+      num(r.labor_rate) ??
+      num(r.pay_rate) ??
+      num(r.payrate) ??
+      num(r.rate) ??
+      num(r.hourly_rate) ??
+      null
+    );
+  }
+  function getPerDiem(r: Employee): number | null {
+    return num(r.per_diem);
+  }
+  const moneyFmt = (v: unknown) => {
+    const n = num(v);
+    return n === null ? "-" : `$${n.toFixed(2)}`;
+  };
+  const numFmt = (v: unknown) => {
+    const n = num(v);
+    return n === null ? "-" : n.toFixed(2);
+  };
+
   const fetchRows = React.useCallback(async () => {
     setLoading(true);
     setLoadError(null);
-
-    // we’ll try absolute first, then relative as a fallback
     const candidates = [
       API ? `${API}/employees?limit=2000` : null,
-      "/employees?limit=2000", // relative fallback (works if you are reverse proxying)
+      "/employees?limit=2000",
     ].filter(Boolean) as string[];
-
     for (const url of candidates) {
       try {
-        console.log("[employees] fetching", url);
         const res = await fetch(url, { cache: "no-store" });
-        if (!res.ok) {
-          const text = await res.text();
-          console.warn("[employees] non-OK response", res.status, text);
-          throw new Error(`${res.status} ${res.statusText}`);
-        }
-
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
         const data = await res.json();
-        console.log("[employees] payload", data);
-
         const next: Employee[] = Array.isArray((data as any)?.rows)
           ? (data as any).rows
           : Array.isArray(data)
           ? (data as any)
           : [];
-
         setRows(next);
         setLoading(false);
-        return; // success
-      } catch (err) {
-        console.error("[employees] fetch failed for", url, err);
-        // try the next candidate
+        return;
+      } catch {
+        /* try next candidate */
       }
     }
-
     setLoadError(
       `Could not load employees. Check NEXT_PUBLIC_API_BASE (current: "${API || "NOT SET"}") and that /employees is reachable.`
     );
@@ -127,15 +144,6 @@ export default function EmployeesPage() {
     fetchRows();
   }, [fetchRows]);
 
-  const moneyFmt = (p: { value: unknown }) => {
-    const n = Number(p?.value);
-    return Number.isFinite(n) ? `$${n.toFixed(2)}` : "-";
-  };
-  const numFmt = (p: { value: unknown }) => {
-    const n = Number(p?.value);
-    return Number.isFinite(n) ? n.toFixed(2) : "-";
-  };
-
   const columns: GridColDef<Employee>[] = [
     { field: "employee_id", headerName: "ID", minWidth: 120 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
@@ -144,8 +152,31 @@ export default function EmployeesPage() {
     { field: "location", headerName: "Location", minWidth: 120 },
     { field: "position", headerName: "Position", minWidth: 140 },
     { field: "phone", headerName: "Phone", minWidth: 150 },
-    { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
-    { field: "labor_rate", headerName: "Labor Rate", minWidth: 130, valueFormatter: moneyFmt },
+
+    // Per Diem shown as a plain number
+    {
+      field: "per_diem",
+      headerName: "Per Diem",
+      minWidth: 120,
+      valueGetter: (params) => getPerDiem(params.row),
+      valueFormatter: (p) => numFmt(p.value),
+      type: "number",
+    },
+
+    // *** Robust Labor Rate — reads from labor_rate, pay_rate, payrate, rate, hourly_rate
+    {
+      field: "labor_rate_display",
+      headerName: "Labor Rate",
+      minWidth: 140,
+      valueGetter: (params) => getRate(params.row),
+      valueFormatter: (p) => moneyFmt(p.value),
+      sortComparator: (a, b) => {
+        const na = typeof a === "number" ? a : num(a) ?? -Infinity;
+        const nb = typeof b === "number" ? b : num(b) ?? -Infinity;
+        return na - nb;
+      },
+    },
+
     {
       field: "actions",
       headerName: "Actions",
@@ -194,15 +225,28 @@ export default function EmployeesPage() {
   async function save() {
     setSaving(true);
     try {
-      const payload: Record<string, unknown> = { ...form };
-      payload.labor_rate =
-        payload.labor_rate === "" || payload.labor_rate == null ? null : Number(payload.labor_rate as any);
-      payload.per_diem =
-        payload.per_diem === "" || payload.per_diem == null ? null : Number(payload.per_diem as any);
+      // write canonical keys back: labor_rate & per_diem
+      const canonical = {
+        ...form,
+        labor_rate:
+          form.labor_rate ??
+          form.pay_rate ??
+          form.payrate ??
+          form.rate ??
+          form.hourly_rate ??
+          "",
+        per_diem: form.per_diem ?? "",
+      };
 
-      const base = API || ""; // if API is unset, use relative
+      // coerce numerics
+      const lr = num(canonical.labor_rate);
+      const pd = num(canonical.per_diem);
+      (canonical as any).labor_rate = lr;
+      (canonical as any).per_diem = pd;
+
+      const base = API || "";
       if (mode === "create") {
-        if (!payload.employee_id || !payload.name) {
+        if (!canonical.employee_id || !canonical.name) {
           setError("Employee ID and Name are required");
           setSaving(false);
           return;
@@ -210,12 +254,12 @@ export default function EmployeesPage() {
         const res = await fetch(`${base}/employees`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+          body: JSON.stringify(canonical),
         });
         if (!res.ok) throw new Error(await res.text());
       } else {
-        const id = String(payload.employee_id ?? "");
-        const { employee_id, ...rest } = payload;
+        const id = String(canonical.employee_id ?? "");
+        const { employee_id, ...rest } = canonical as any;
         const res = await fetch(`${base}/employees/${encodeURIComponent(id)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -234,12 +278,10 @@ export default function EmployeesPage() {
 
   return (
     <Stack gap={2}>
-      {/* Helpful banner while we troubleshoot */}
       <Typography variant="caption" sx={{ color: "text.secondary" }}>
         API base: <b>{API || "(relative)"}</b> • Loaded: <b>{rows.length}</b> row(s) {loadError ? `• ${loadError}` : ""}
       </Typography>
 
-      {/* Toolbar */}
       <Stack direction={{ xs: "column", sm: "row" }} alignItems={{ sm: "center" }} justifyContent="space-between" gap={1}>
         <Typography variant="h5" fontWeight={600}>
           Employees
@@ -306,7 +348,14 @@ export default function EmployeesPage() {
             <TextField
               label="Labor Rate"
               type="number"
-              value={form.labor_rate ?? ""}
+              value={
+                (form.labor_rate as any) ??
+                (form.pay_rate as any) ??
+                (form.payrate as any) ??
+                (form.rate as any) ??
+                (form.hourly_rate as any) ??
+                ""
+              }
               onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
             />
           </Box>
