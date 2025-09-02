@@ -19,7 +19,7 @@ from botocore.exceptions import ClientError
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_FILE = os.getenv("DB_FILE", "employees_with_company_v2.db")
+DB_FILE = os.getenv("DB_FILE", "employees_with_company_v3.db")
 DB_PATH = DB_FILE if os.path.isabs(DB_FILE) else os.path.join(DATA_DIR, DB_FILE)
 
 # S3-compatible object storage (optional)
@@ -339,3 +339,4 @@ def debug_sample(limit: int = 3):
         for row in rows:
             row["labor_rate_display"] = compute_labor_rate_display(row)
         return {"table": tname, "rows": rows}
+
