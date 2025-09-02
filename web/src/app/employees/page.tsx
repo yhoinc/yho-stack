@@ -1,5 +1,4 @@
 "use client";
-
 import * as React from "react";
 import {
   Box,
@@ -17,7 +16,6 @@ import { DataGrid, GridColDef, GridToolbar } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import AddIcon from "@mui/icons-material/Add";
 
-// ---------- Types ----------
 type Employee = {
   employee_id: string;
   reference?: string | null;
@@ -27,118 +25,61 @@ type Employee = {
   phone?: string | null;
   address?: string | null;
   position?: string | null;
-
   labor_rate?: number | string | null;
   per_diem?: number | string | null;
-
-  // legacy/alt fields that the API might still return
-  pay_rate?: number | string | null;
-  payrate?: number | string | null;
-  rate?: number | string | null;
-  hourly_rate?: number | string | null;
-
-  // provided by the API for consistent display
-  labor_rate_display?: number | null;
-
   deduction?: string | null;
   debt?: string | null;
   payment_count?: string | null;
   apartment_id?: string | null;
 };
 
-type ApiEmployeesResponse = {
-  rows: Employee[];
-  total: number;
-  limit: number;
-  offset: number;
-  table?: string;
-  columns?: string[];
-};
-
-// ---------- Utils ----------
-const coerceNumber = (v: unknown): number | null => {
-  if (v === null || v === undefined) return null;
-  const n = Number(String(v).replace(/[$,]/g, ""));
-  return Number.isFinite(n) ? n : null;
-};
-
-const moneyFmt = (v: unknown): string => {
-  const n = coerceNumber(v);
-  return n === null ? "-" : `$${n.toFixed(2)}`;
-};
-
-const numFmt = (v: unknown): string => {
-  const n = coerceNumber(v);
-  return n === null ? "-" : n.toFixed(2);
-};
-
-const fileDownload = (filename: string, contents: string, mime = "text/csv;charset=utf-8") => {
-  const blob = new Blob([contents], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
-};
-
-// ---------- Page ----------
 export default function EmployeesPage() {
-  const API_BASE_RAW = process.env.NEXT_PUBLIC_API_BASE || "";
-  const API = API_BASE_RAW.replace(/\/$/, "");
-
+  const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const [rows, setRows] = React.useState<Employee[]>([]);
-  const [loading, setLoading] = React.useState<boolean>(false);
-  const [loadError, setLoadError] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(false);
 
-  // search
-  const [query, setQuery] = React.useState<string>("");
-  const [debounced, setDebounced] = React.useState<string>(query);
+  // search state (local filter of loaded rows)
+  const [query, setQuery] = React.useState("");
+  const [debounced, setDebounced] = React.useState(query);
   React.useEffect(() => {
-    const id = window.setTimeout(() => setDebounced(query), 250);
+    const id = window.setTimeout(() => setDebounced(query.trim().toLowerCase()), 250);
     return () => window.clearTimeout(id);
   }, [query]);
 
   const filteredRows = React.useMemo(() => {
-    const q = debounced.trim().toLowerCase();
-    if (!q) return rows;
-    const toText = (v: unknown) => (v == null ? "" : String(v));
+    if (!debounced) return rows;
+    const pick = (v: unknown) => (v == null ? "" : String(v).toLowerCase());
     return rows.filter((r) => {
-      const hay = [
-        r.employee_id,
-        r.name,
-        r.reference,
-        r.company,
-        r.location,
-        r.position,
-        r.phone,
-        r.address,
-        r.apartment_id,
-      ]
-        .map(toText)
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(q);
+      const hay =
+        [
+          r.employee_id,
+          r.name,
+          r.reference,
+          r.company,
+          r.location,
+          r.position,
+          r.phone,
+          r.address,
+        ]
+          .map(pick)
+          .join(" ") || "";
+      return hay.includes(debounced);
     });
   }, [rows, debounced]);
 
-  // fetch
+  const [open, setOpen] = React.useState(false);
+  const [mode, setMode] = React.useState<"create" | "edit">("create");
+  const [form, setForm] = React.useState<Partial<Employee>>({});
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
   const fetchRows = React.useCallback(async () => {
     setLoading(true);
-    setLoadError(null);
     try {
-      const url = `${API}/employees?limit=2000`;
-      const res = await fetch(url, { cache: "no-store" });
-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-      const data = (await res.json()) as ApiEmployeesResponse;
-      const next = Array.isArray(data?.rows) ? data.rows : [];
-      setRows(next);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Load failed";
-      setLoadError(`Could not load employees: ${msg}. Check NEXT_PUBLIC_API_BASE ("${API || "(unset)"}").`);
-      setRows([]);
+      const r = await fetch(`${API}/employees?limit=1000`);
+      const d = await r.json();
+      const raw: any[] = d?.rows ?? [];
+      setRows(raw); // trust backend values
     } finally {
       setLoading(false);
     }
@@ -148,14 +89,54 @@ export default function EmployeesPage() {
     fetchRows();
   }, [fetchRows]);
 
-  // dialog state
-  const [open, setOpen] = React.useState<boolean>(false);
-  const [mode, setMode] = React.useState<"create" | "edit">("create");
-  const [form, setForm] = React.useState<Partial<Employee>>({});
-  const [saving, setSaving] = React.useState<boolean>(false);
-  const [error, setError] = React.useState<string | null>(null);
+  const moneyFmt = (p: any) => {
+    const v = p?.value;
+    return v == null || v === "" || Number.isNaN(Number(v))
+      ? "-"
+      : `$${Number(v).toFixed(2)}`;
+  };
+  const numFmt = (p: any) => {
+    const v = p?.value;
+    return v == null || v === "" || Number.isNaN(Number(v))
+      ? "-"
+      : Number(v).toFixed(2);
+  };
 
-  const openCreate = () => {
+  const columns: GridColDef[] = [
+    { field: "employee_id", headerName: "ID", minWidth: 120 },
+    { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
+    { field: "reference", headerName: "Ref", minWidth: 110 },
+    { field: "company", headerName: "Company", minWidth: 140 },
+    { field: "location", headerName: "Location", minWidth: 120 },
+    { field: "position", headerName: "Position", minWidth: 140 },
+    { field: "phone", headerName: "Phone", minWidth: 150 },
+    { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
+    {
+      field: "labor_rate",
+      headerName: "Labor Rate",
+      minWidth: 130,
+      sortable: true,
+      renderCell: (params) => {
+        const v = params.row?.labor_rate ?? (params.row as any)?.pay_rate ?? null;
+        if (v == null || v === "" || Number.isNaN(Number(v))) return "-";
+        return `$${Number(v).toFixed(2)}`;
+      },
+    },
+    {
+      field: "actions",
+      headerName: "Actions",
+      sortable: false,
+      filterable: false,
+      width: 100,
+      renderCell: (params) => (
+        <IconButton size="small" onClick={() => openEdit(params.row as Employee)} aria-label="edit">
+          <EditIcon fontSize="small" />
+        </IconButton>
+      ),
+    },
+  ];
+
+  function openCreate() {
     setMode("create");
     setForm({
       employee_id: "",
@@ -170,36 +151,27 @@ export default function EmployeesPage() {
     });
     setError(null);
     setOpen(true);
-  };
+  }
 
-  const openEdit = (emp: Employee) => {
+  function openEdit(emp: Employee) {
     setMode("edit");
     setForm({ ...emp });
     setError(null);
     setOpen(true);
-  };
+  }
 
-  const save = async () => {
+  async function save() {
     setSaving(true);
     try {
-      // Always write canonical keys: labor_rate & per_diem
-      const lr =
-        coerceNumber(form.labor_rate) ??
-        coerceNumber(form.pay_rate) ??
-        coerceNumber(form.payrate) ??
-        coerceNumber(form.rate) ??
-        coerceNumber(form.hourly_rate);
-
-      const payload: Record<string, unknown> = {
-        ...form,
-        labor_rate: lr,
-        per_diem: coerceNumber(form.per_diem),
-      };
+      const payload: any = { ...form };
+      // coerce numerics if provided
+      payload.labor_rate =
+        payload.labor_rate === "" || payload.labor_rate == null ? null : Number(payload.labor_rate);
+      payload.per_diem =
+        payload.per_diem === "" || payload.per_diem == null ? null : Number(payload.per_diem);
 
       if (mode === "create") {
-        const id = String(payload.employee_id || "").trim();
-        const name = String(payload.name || "").trim();
-        if (!id || !name) {
+        if (!payload.employee_id || !payload.name) {
           setError("Employee ID and Name are required");
           setSaving(false);
           return;
@@ -211,9 +183,8 @@ export default function EmployeesPage() {
         });
         if (!res.ok) throw new Error(await res.text());
       } else {
-        const id = String(payload.employee_id || "");
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { employee_id: _omit, labor_rate_display: _omit2, ...rest } = payload;
+        const id = payload.employee_id;
+        const { employee_id, ...rest } = payload;
         const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
@@ -221,97 +192,18 @@ export default function EmployeesPage() {
         });
         if (!res.ok) throw new Error(await res.text());
       }
-
       setOpen(false);
       await fetchRows();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Save failed");
+    } catch (e: any) {
+      setError(e?.message || "Save failed");
     } finally {
       setSaving(false);
     }
-  };
-
-  // columns
-  const columns: GridColDef<Employee>[] = [
-    { field: "employee_id", headerName: "ID", minWidth: 120 },
-    { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
-    { field: "reference", headerName: "Ref", minWidth: 110 },
-    { field: "company", headerName: "Company", minWidth: 140 },
-    { field: "location", headerName: "Location", minWidth: 120 },
-    { field: "position", headerName: "Position", minWidth: 140 },
-    { field: "phone", headerName: "Phone", minWidth: 150 },
-    {
-      field: "per_diem",
-      headerName: "Per Diem",
-      minWidth: 120,
-      type: "number",
-      valueFormatter: (p) => numFmt(p.value),
-    },
-    {
-      field: "labor_rate_display",
-      headerName: "Labor Rate",
-      minWidth: 140,
-      type: "number",
-      valueFormatter: (p) => moneyFmt(p.value),
-      sortComparator: (a, b) => {
-        const na = typeof a === "number" ? a : coerceNumber(a) ?? -Infinity;
-        const nb = typeof b === "number" ? b : coerceNumber(b) ?? -Infinity;
-        return na - nb;
-      },
-    },
-    {
-      field: "actions",
-      headerName: "Actions",
-      sortable: false,
-      filterable: false,
-      width: 100,
-      renderCell: (params) => (
-        <IconButton size="small" onClick={() => openEdit(params.row)} aria-label="edit">
-          <EditIcon fontSize="small" />
-        </IconButton>
-      ),
-    },
-  ];
-
-  // Export CSV of the filteredRows
-  const exportCsv = () => {
-    const cols = [
-      "employee_id",
-      "name",
-      "reference",
-      "company",
-      "location",
-      "position",
-      "phone",
-      "per_diem",
-      "labor_rate_display",
-    ] as const;
-
-    const header = cols.join(",");
-    const lines = filteredRows.map((r) =>
-      cols
-        .map((c) => {
-          const val =
-            c === "labor_rate_display"
-              ? coerceNumber(r.labor_rate_display)
-              : c === "per_diem"
-              ? coerceNumber(r.per_diem)
-              : (r[c] as unknown);
-          const s = val == null ? "" : String(val);
-          return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-        })
-        .join(","),
-    );
-    fileDownload("employees_export.csv", [header, ...lines].join("\n"));
-  };
+  }
 
   return (
     <Stack gap={2}>
-      <Typography variant="caption" sx={{ color: "text.secondary" }}>
-        API: <b>{API || "(relative)"}</b> • Loaded: <b>{rows.length}</b>{" "}
-        {loadError ? `• ${loadError}` : ""}
-      </Typography>
-
+      {/* Header row with search and add */}
       <Stack
         direction={{ xs: "column", sm: "row" }}
         alignItems={{ sm: "center" }}
@@ -329,9 +221,6 @@ export default function EmployeesPage() {
             onChange={(e) => setQuery(e.target.value)}
             sx={{ width: { xs: "100%", sm: 360 } }}
           />
-          <Button variant="outlined" onClick={exportCsv}>
-            Export CSV
-          </Button>
           <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
             Add Employee
           </Button>
@@ -357,6 +246,7 @@ export default function EmployeesPage() {
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
         <DialogContent dividers>
+          {/* simple 2-column responsive form without MUI Grid to avoid TS issues */}
           <Box
             sx={{
               display: "grid",
@@ -410,14 +300,7 @@ export default function EmployeesPage() {
             <TextField
               label="Labor Rate"
               type="number"
-              value={
-                (form.labor_rate as string | number | undefined) ??
-                (form.pay_rate as string | number | undefined) ??
-                (form.payrate as string | number | undefined) ??
-                (form.rate as string | number | undefined) ??
-                (form.hourly_rate as string | number | undefined) ??
-                ""
-              }
+              value={form.labor_rate ?? ""}
               onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
             />
           </Box>
