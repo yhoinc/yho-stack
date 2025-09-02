@@ -5,9 +5,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, PlainTextResponse
+from fastapi.responses import StreamingResponse
 
-# Optional S3 (Supabase/Backblaze/R2-compatible)
+# ----- Optional S3 (R2 / Backblaze / Supabase-compatible) -----
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
@@ -22,6 +22,7 @@ os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.getenv("DB_FILE", "employees_with_company_v2.db")
 DB_PATH = DB_FILE if os.path.isabs(DB_FILE) else os.path.join(DATA_DIR, DB_FILE)
 
+# S3-compatible object storage (optional)
 S3_ENDPOINT = (os.getenv("S3_ENDPOINT") or "").strip()
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")
@@ -40,13 +41,13 @@ S3_HOST = _normalize_endpoint(S3_ENDPOINT) if S3_ENDPOINT else ""
 
 
 # =============================================================================
-# App + CORS
+# App
 # =============================================================================
 app = FastAPI(title="YHO API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],         # tighten in prod
+    allow_origins=["*"],          # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -59,55 +60,65 @@ app.add_middleware(
 # =============================================================================
 def open_db() -> sqlite3.Connection:
     if not os.path.exists(DB_PATH):
-        # Give a clear error instead of empty list (helps debugging)
         raise FileNotFoundError(f"DB not found at {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
+def list_tables(conn: sqlite3.Connection) -> List[str]:
+    t = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    return [r["name"] for r in t]
+
+def dict_from_row(r: sqlite3.Row) -> Dict[str, Any]:
+    return {k: r[k] for k in r.keys()}
+
+def first_table_with_column(conn: sqlite3.Connection, colname: str) -> Optional[Tuple[str, List[str]]]:
+    for t in list_tables(conn):
+        cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{t}')").fetchall()]
+        if colname in cols:
+            return t, cols
+    return None
+
 def discover_employee_table(conn: sqlite3.Connection) -> Tuple[str, List[str]]:
     """
-    Find a table that contains an 'employee_id' column. Return (table_name, column_names).
+    Prefer a table literally named 'employees', else any table with 'employee_id' column,
+    else the first table found.
     """
-    rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-    candidates: List[Tuple[str, List[str]]] = []
-    for r in rows:
-        tname = r["name"]
-        cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
-        if "employee_id" in cols:
-            candidates.append((tname, cols))
-    if not candidates:
-        raise RuntimeError("No table with an 'employee_id' column found.")
+    tables = list_tables(conn)
+    if not tables:
+        raise RuntimeError("No tables found in SQLite DB.")
 
-    # Prefer common names if many tables qualify
-    preferred = ["employees", "employee", "staff", "people", "workers"]
-    for p in preferred:
-        for t, cols in candidates:
-            if t.lower() == p:
-                return t, cols
-    return candidates[0]
+    # Prefer exact 'employees'
+    for t in tables:
+        if t.lower() == "employees":
+            cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{t}')").fetchall()]
+            return t, cols
+
+    # Else table with employee_id
+    found = first_table_with_column(conn, "employee_id")
+    if found:
+        return found
+
+    # Else first table
+    tname = tables[0]
+    cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
+    return tname, cols
 
 def to_float(value: Any) -> Optional[float]:
     if value is None:
         return None
     try:
-        # handle numbers
         if isinstance(value, (int, float)):
             return float(value)
-        # handle strings with $ and commas
         s = str(value).strip()
         if not s:
             return None
         s = s.replace("$", "").replace(",", "")
-        n = float(s)
-        return n
+        return float(s)
     except Exception:
         return None
 
 def compute_labor_rate_display(row: Dict[str, Any]) -> Optional[float]:
-    """
-    Try common rate field names and return a single numeric value for the UI.
-    """
     for key in ("labor_rate", "pay_rate", "payrate", "rate", "hourly_rate"):
         if key in row:
             n = to_float(row.get(key))
@@ -127,7 +138,7 @@ def filter_payload_to_table(payload: Dict[str, Any], columns: List[str]) -> Dict
 
 
 # =============================================================================
-# Employees API
+# Employees
 # =============================================================================
 @app.get("/employees")
 def list_employees(limit: int = Query(1000, ge=1, le=10000), offset: int = Query(0, ge=0)):
@@ -135,17 +146,11 @@ def list_employees(limit: int = Query(1000, ge=1, le=10000), offset: int = Query
         with open_db() as conn:
             tname, cols = discover_employee_table(conn)
             total = conn.execute(f"SELECT COUNT(*) AS c FROM '{tname}'").fetchone()["c"]
-            rs = conn.execute(
-                f"SELECT * FROM '{tname}' LIMIT ? OFFSET ?",
-                (limit, offset),
-            ).fetchall()
-            rows = [{k: r[k] for k in r.keys()} for r in rs]
-            # add derived display field (safe and consistent for the UI)
+            rs = conn.execute(f"SELECT * FROM '{tname}' LIMIT ? OFFSET ?", (limit, offset)).fetchall()
+            rows = [dict_from_row(r) for r in rs]
             for row in rows:
                 row["labor_rate_display"] = compute_labor_rate_display(row)
-            return {"rows": rows, "total": total, "limit": limit, "offset": offset, "table": tname}
-    except FileNotFoundError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            return {"rows": rows, "total": total, "limit": limit, "offset": offset, "table": tname, "columns": cols}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -154,13 +159,10 @@ def get_employee(employee_id: str):
     try:
         with open_db() as conn:
             tname, cols = discover_employee_table(conn)
-            r = conn.execute(
-                f"SELECT * FROM '{tname}' WHERE employee_id = ?",
-                (employee_id,),
-            ).fetchone()
+            r = conn.execute(f"SELECT * FROM '{tname}' WHERE employee_id = ?", (employee_id,)).fetchone()
             if not r:
                 raise HTTPException(status_code=404, detail="Not found")
-            row = {k: r[k] for k in r.keys()}
+            row = dict_from_row(r)
             row["labor_rate_display"] = compute_labor_rate_display(row)
             return row
     except HTTPException:
@@ -176,6 +178,8 @@ def create_employee(payload: Dict[str, Any]):
         with open_db() as conn:
             tname, cols = discover_employee_table(conn)
             data = filter_payload_to_table(payload, cols)
+            if not data:
+                raise HTTPException(status_code=400, detail="No valid fields to insert")
             keys = list(data.keys())
             qmarks = ",".join(["?"] * len(keys))
             sql = f"INSERT INTO '{tname}' ({','.join(keys)}) VALUES ({qmarks})"
@@ -211,7 +215,7 @@ def patch_employee(employee_id: str, payload: Dict[str, Any]):
 
 
 # =============================================================================
-# Documents (S3-compatible)
+# Documents (S3-compatible). If not configured, returns empty list for /documents.
 # =============================================================================
 def s3_client():
     if not (S3_HOST and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET):
@@ -244,11 +248,11 @@ def list_documents(limit: int = 500):
             if len(rows) >= limit:
                 break
         return {"rows": rows, "total": len(rows)}
+    except RuntimeError as e:
+        # not configured -> don't break the whole app
+        return {"rows": [], "total": 0, "note": str(e)}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=str(e))
-    except RuntimeError as e:
-        # not configured—return empty list rather than 500 so UI still loads
-        return {"rows": [], "total": 0, "note": str(e)}
 
 @app.post("/documents/upload")
 async def upload_document(
@@ -272,9 +276,9 @@ async def upload_document(
             ContentType=file.content_type or "application/octet-stream",
         )
         return {"ok": True, "key": key}
-    except ClientError as e:
-        raise HTTPException(status_code=500, detail=str(e))
     except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except ClientError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/documents/{key:path}/download")
@@ -284,25 +288,23 @@ def download_document(key: str):
         obj = s3.get_object(Bucket=S3_BUCKET, Key=key)
         content_type = obj.get("ContentType") or "application/octet-stream"
         data = obj["Body"].read()
-        return StreamingResponse(io.BytesIO(data), media_type=content_type,
-                                 headers={"Content-Disposition": f'inline; filename="{os.path.basename(key)}"'})
+        return StreamingResponse(
+            io.BytesIO(data),
+            media_type=content_type,
+            headers={"Content-Disposition": f'inline; filename="{os.path.basename(key)}"'},
+        )
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except ClientError as e:
         code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
         raise HTTPException(status_code=code, detail=str(e))
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/documents/sync")
-def sync_documents():
-    return {"ok": True}
 
 
 # =============================================================================
-# Health
+# Debug / Health
 # =============================================================================
 @app.get("/debug/health")
 def health():
-    # Don’t fail health if S3 isn’t configured—just report it
     s3_ok = bool(S3_HOST and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET)
     return {
         "ok": True,
@@ -311,3 +313,29 @@ def health():
         "s3_configured": s3_ok,
         "bucket": S3_BUCKET if s3_ok else None,
     }
+
+@app.get("/debug/db")
+def debug_db():
+    with open_db() as conn:
+        info: Dict[str, Any] = {"tables": [], "meta": []}
+        tables = list_tables(conn)
+        info["tables"] = tables
+        for t in tables:
+            cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{t}')").fetchall()]
+            sample = conn.execute(f"SELECT * FROM '{t}' LIMIT 1").fetchone()
+            sample_dict = dict_from_row(sample) if sample else None
+            info["meta"].append({"table": t, "columns": cols, "sample": sample_dict})
+        return info
+
+@app.get("/debug/sample")
+def debug_sample(limit: int = 3):
+    with open_db() as conn:
+        tables = list_tables(conn)
+        if not tables:
+            return {"tables": [], "rows": []}
+        tname = next((t for t in tables if t.lower() == "employees"), tables[0])
+        rs = conn.execute(f"SELECT * FROM '{tname}' LIMIT ?", (limit,)).fetchall()
+        rows = [dict_from_row(r) for r in rs]
+        for row in rows:
+            row["labor_rate_display"] = compute_labor_rate_display(row)
+        return {"table": tname, "rows": rows}
