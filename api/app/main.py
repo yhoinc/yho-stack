@@ -19,8 +19,8 @@ from botocore.exceptions import ClientError
 DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
-DB_FILE = os.getenv("DB_FILE", "employees_with_company_v3.db")
-DB_PATH = DB_FILE if os.path.isabs(DB_FILE) else os.path.join(DATA_DIR, DB_FILE)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "employees_with_company_v3.db")
 
 # S3-compatible object storage (optional)
 S3_ENDPOINT = (os.getenv("S3_ENDPOINT") or "").strip()
@@ -339,4 +339,5 @@ def debug_sample(limit: int = 3):
         for row in rows:
             row["labor_rate_display"] = compute_labor_rate_display(row)
         return {"table": tname, "rows": rows}
+
 
