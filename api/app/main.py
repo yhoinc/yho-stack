@@ -138,9 +138,22 @@ def list_employees(limit: int = Query(1000, ge=1, le=10000), offset: int = Query
     try:
         with open_db() as conn:
             tname, cols = discover_employee_table(conn)
+
+            # Build a COALESCE() that only references columns that actually exist
+            rate_candidates = [c for c in ("labor_rate","pay_rate","payrate","rate","hourly_rate") if c in cols]
+            if rate_candidates:
+                # CREATE a SQL expression to strip $ and , then cast to REAL
+                # COALESCE will pick the first non-NULL
+                coalesce_expr = "COALESCE(" + ", ".join(rate_candidates) + ")"
+                rate_sql = f"CAST(REPLACE(REPLACE({coalesce_expr}, '$',''), ',', '') AS REAL) AS labor_rate_display"
+            else:
+                # no known rate columns; expose NULL
+                rate_sql = "NULL AS labor_rate_display"
+
             total = conn.execute(f"SELECT COUNT(*) AS c FROM '{tname}'").fetchone()["c"]
             rows = conn.execute(
-                f"SELECT * FROM '{tname}' LIMIT ? OFFSET ?", (limit, offset)
+                f"SELECT *, {rate_sql} FROM '{tname}' LIMIT ? OFFSET ?",
+                (limit, offset),
             ).fetchall()
             data = [dict_from_row(r) for r in rows]
             return {"rows": data, "total": total, "limit": limit, "offset": offset, "table": tname}
@@ -283,3 +296,4 @@ def health():
         return {"ok": True, "db": ok_db, "db_path": DB_PATH}
     except Exception as e:
         return PlainTextResponse(str(e), status_code=500)
+
