@@ -28,17 +28,16 @@ type Employee = {
   address?: string | null;
   position?: string | null;
 
-  // canonical numeric fields (may come as string from API -> we coerce)
   labor_rate?: number | string | null;
   per_diem?: number | string | null;
 
-  // legacy/alt fields (API also returns labor_rate_display)
+  // legacy/alt fields that the API might still return
   pay_rate?: number | string | null;
   payrate?: number | string | null;
   rate?: number | string | null;
   hourly_rate?: number | string | null;
 
-  // derived from API (guaranteed by backend)
+  // provided by the API for consistent display
   labor_rate_display?: number | null;
 
   deduction?: string | null;
@@ -86,7 +85,7 @@ const fileDownload = (filename: string, contents: string, mime = "text/csv;chars
 };
 
 // ---------- Page ----------
-export default function EmployeesPage(): JSX.Element {
+export default function EmployeesPage() {
   const API_BASE_RAW = process.env.NEXT_PUBLIC_API_BASE || "";
   const API = API_BASE_RAW.replace(/\/$/, "");
 
@@ -213,7 +212,6 @@ export default function EmployeesPage(): JSX.Element {
         if (!res.ok) throw new Error(await res.text());
       } else {
         const id = String(payload.employee_id || "");
-        // Don’t send the key field inside PATCH set
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
         const { employee_id: _omit, labor_rate_display: _omit2, ...rest } = payload;
         const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
@@ -294,12 +292,12 @@ export default function EmployeesPage(): JSX.Element {
       cols
         .map((c) => {
           const val =
-            c === "labor_rate_display" ? coerceNumber(r.labor_rate_display) :
-            c === "per_diem" ? coerceNumber(r.per_diem) :
-            (r[c] as unknown);
-
+            c === "labor_rate_display"
+              ? coerceNumber(r.labor_rate_display)
+              : c === "per_diem"
+              ? coerceNumber(r.per_diem)
+              : (r[c] as unknown);
           const s = val == null ? "" : String(val);
-          // basic CSV escaping
           return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
         })
         .join(","),
@@ -310,7 +308,8 @@ export default function EmployeesPage(): JSX.Element {
   return (
     <Stack gap={2}>
       <Typography variant="caption" sx={{ color: "text.secondary" }}>
-        API: <b>{API || "(relative)"}</b> • Loaded: <b>{rows.length}</b> {loadError ? `• ${loadError}` : ""}
+        API: <b>{API || "(relative)"}</b> • Loaded: <b>{rows.length}</b>{" "}
+        {loadError ? `• ${loadError}` : ""}
       </Typography>
 
       <Stack
