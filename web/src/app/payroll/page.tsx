@@ -34,8 +34,7 @@ type Employee = {
 
 export default function PayrollPage() {
   const API_BASE_RAW = process.env.NEXT_PUBLIC_API_BASE || "";
-  // trim trailing slash if present
-  const API = API_BASE_RAW.replace(/\/$/, "");
+  const API = API_BASE_RAW.replace(/\/$/, ""); // trim trailing slash
 
   const [rows, setRows] = React.useState<Employee[]>([]);
   const [loading, setLoading] = React.useState(false);
@@ -73,7 +72,6 @@ export default function PayrollPage() {
     fetchRows();
   }, [fetchRows]);
 
-  // Easy currency formatter
   const money = (n: number | string | null | undefined) => {
     const v = Number(n);
     if (!isFinite(v)) return "$0.00";
@@ -83,7 +81,10 @@ export default function PayrollPage() {
   // Commit numeric edits for week1/week2
   const handleCellEditStop = React.useCallback(
     (params: GridCellEditStopParams, reason: GridCellEditStopReasons) => {
-      if (reason !== GridCellEditStopReasons.enterKeyDown && reason !== GridCellEditStopReasons.cellFocusOut) {
+      if (
+        reason !== GridCellEditStopReasons.enterKeyDown &&
+        reason !== GridCellEditStopReasons.cellFocusOut
+      ) {
         return;
       }
       const { id, field } = params;
@@ -104,18 +105,12 @@ export default function PayrollPage() {
     []
   );
 
-  // Filter on a few common text fields
+  // Filter on text fields
   const filtered = React.useMemo(() => {
     if (!search.trim()) return rows;
     const q = search.trim().toLowerCase();
     return rows.filter((r) => {
-      const hay = [
-        r.name,
-        r.reference,
-        r.company,
-        r.location,
-        r.position,
-      ]
+      const hay = [r.name, r.reference, r.company, r.location, r.position]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
@@ -123,6 +118,7 @@ export default function PayrollPage() {
     });
   }, [rows, search]);
 
+  // NOTE: we cast (p as any) when reading p.row to avoid generic TS issues on CI.
   const columns: GridColDef[] = [
     { field: "reference", headerName: "Ref", minWidth: 110 },
     { field: "company", headerName: "Company", minWidth: 130 },
@@ -133,7 +129,7 @@ export default function PayrollPage() {
       headerName: "Rate",
       minWidth: 110,
       sortable: true,
-      valueGetter: (p) => Number(p.row?.labor_rate ?? 0),
+      valueGetter: (p) => Number((p as any).row?.labor_rate ?? 0),
       valueFormatter: (p) => money(p.value as number),
     },
     {
@@ -142,7 +138,7 @@ export default function PayrollPage() {
       type: "number",
       minWidth: 110,
       editable: true,
-      valueGetter: (p) => Number(p.row?.week1 ?? 0),
+      valueGetter: (p) => Number((p as any).row?.week1 ?? 0),
     },
     {
       field: "week2",
@@ -150,7 +146,7 @@ export default function PayrollPage() {
       type: "number",
       minWidth: 110,
       editable: true,
-      valueGetter: (p) => Number(p.row?.week2 ?? 0),
+      valueGetter: (p) => Number((p as any).row?.week2 ?? 0),
     },
     {
       field: "check",
@@ -158,9 +154,9 @@ export default function PayrollPage() {
       minWidth: 130,
       sortable: false,
       valueGetter: (p) => {
-        const rate = Number(p.row?.labor_rate ?? 0);
-        const w1 = Number(p.row?.week1 ?? 0);
-        const w2 = Number(p.row?.week2 ?? 0);
+        const rate = Number((p as any).row?.labor_rate ?? 0);
+        const w1 = Number((p as any).row?.week1 ?? 0);
+        const w2 = Number((p as any).row?.week2 ?? 0);
         return (w1 + w2) * rate;
       },
       valueFormatter: (p) => money(p.value as number),
@@ -169,7 +165,9 @@ export default function PayrollPage() {
 
   // Export only rows with hours to CSV
   const exportCSV = React.useCallback(() => {
-    const withHours = rows.filter((r) => (Number(r.week1) || 0) > 0 || (Number(r.week2) || 0) > 0);
+    const withHours = rows.filter(
+      (r) => (Number(r.week1) || 0) > 0 || (Number(r.week2) || 0) > 0
+    );
     if (withHours.length === 0) {
       alert("No rows with hours to export.");
       return;
@@ -211,7 +209,9 @@ export default function PayrollPage() {
       lines.push(row.join(","));
     }
 
-    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const blob = new Blob([lines.join("\n")], {
+      type: "text/csv;charset=utf-8",
+    });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
@@ -265,13 +265,8 @@ export default function PayrollPage() {
   );
 }
 
-/** CSV-safe quoting */
 function quote(v: unknown): string {
   if (v === null || v === undefined) return "";
   const s = String(v);
-  // quote if contains comma, quote, or newline
-  if (/[",\n]/.test(s)) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
