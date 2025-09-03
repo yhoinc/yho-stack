@@ -1,20 +1,25 @@
 "use client";
-
 import * as React from "react";
 import {
   Box,
   Button,
+  Dialog,
+  DialogActions,
+  DialogContent,
+  DialogTitle,
+  IconButton,
   Stack,
   TextField,
   Typography,
+  MenuItem,
+  Select,
+  FormControl,
+  InputLabel,
 } from "@mui/material";
-import {
-  DataGrid,
-  GridColDef,
-  GridCellEditStopParams,
-  GridCellEditStopReasons,
-  GridToolbar,
-} from "@mui/x-data-grid";
+import { DataGrid, GridColDef } from "@mui/x-data-grid";
+import EditIcon from "@mui/icons-material/Edit";
+import SaveAltIcon from "@mui/icons-material/SaveAlt";
+import FilterAltIcon from "@mui/icons-material/FilterAlt";
 
 type Employee = {
   employee_id: string;
@@ -22,47 +27,44 @@ type Employee = {
   company?: string | null;
   location?: string | null;
   name?: string | null;
-  position?: string | null;
   phone?: string | null;
+  position?: string | null;
   labor_rate?: number | string | null;
   per_diem?: number | string | null;
-
-  // local-only fields for this page
-  week1?: number;
-  week2?: number;
 };
 
 export default function PayrollPage() {
-  const API_BASE_RAW = process.env.NEXT_PUBLIC_API_BASE || "";
-  const API = API_BASE_RAW.replace(/\/$/, ""); // trim trailing slash
+  const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
-  const [rows, setRows] = React.useState<Employee[]>([]);
+  const [allRows, setAllRows] = React.useState<Employee[]>([]);
   const [loading, setLoading] = React.useState(false);
-  const [search, setSearch] = React.useState("");
 
+  // filters
+  const [scope, setScope] = React.useState<"all" | "by">("all");
+  const [company, setCompany] = React.useState<string>("(any)");
+  const [location, setLocation] = React.useState<string>("(any)");
+
+  // search
+  const [query, setQuery] = React.useState<string>("");
+
+  // hours keyed by employee_id (persist across filters/search)
+  const [hours, setHours] = React.useState<
+    Record<string, { w1?: number; w2?: number }>
+  >({});
+
+  // edit dialog
+  const [open, setOpen] = React.useState(false);
+  const [form, setForm] = React.useState<Partial<Employee>>({});
+  const [saving, setSaving] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  // fetch employees
   const fetchRows = React.useCallback(async () => {
     setLoading(true);
     try {
-      const r = await fetch(`${API}/employees?limit=5000`);
-      if (!r.ok) throw new Error(await r.text());
+      const r = await fetch(`${API}/employees?limit=2000`);
       const d = await r.json();
-      const raw: Employee[] = d?.rows ?? [];
-
-      // initialize week fields (keep prior hours if any already in state)
-      setRows((prev) => {
-        const prevMap = new Map(prev.map((p) => [p.employee_id, p]));
-        return raw.map((e) => {
-          const existing = prevMap.get(e.employee_id);
-          return {
-            ...e,
-            week1: existing?.week1 ?? 0,
-            week2: existing?.week2 ?? 0,
-          };
-        });
-      });
-    } catch (err) {
-      console.error("Load payroll failed:", err);
-      setRows([]);
+      setAllRows((d?.rows ?? []) as Employee[]);
     } finally {
       setLoading(false);
     }
@@ -72,141 +74,142 @@ export default function PayrollPage() {
     fetchRows();
   }, [fetchRows]);
 
-  const money = (n: number | string | null | undefined) => {
-    const v = Number(n);
-    if (!isFinite(v)) return "$0.00";
-    return `$${v.toFixed(2)}`;
+  // filter options
+  const companies = React.useMemo(() => {
+    const s = new Set<string>();
+    allRows.forEach((r) => r.company && s.add(String(r.company).trim()));
+    return ["(any)", ...Array.from(s).sort()];
+  }, [allRows]);
+
+  const locations = React.useMemo(() => {
+    const s = new Set<string>();
+    allRows.forEach((r) => r.location && s.add(String(r.location).trim()));
+    return ["(any)", ...Array.from(s).sort()];
+  }, [allRows]);
+
+  // base filtered set by scope/company/location
+  const scopedRows: Employee[] = React.useMemo(() => {
+    if (scope === "all") return allRows;
+    return allRows.filter(
+      (r) =>
+        (company === "(any)" ||
+          String(r.company || "").trim() === company) &&
+        (location === "(any)" ||
+          String(r.location || "").trim() === location)
+    );
+  }, [allRows, scope, company, location]);
+
+  // final rows: apply name search
+  const rows: Employee[] = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return scopedRows;
+    return scopedRows.filter((r) => (r.name || "").toLowerCase().includes(q));
+  }, [scopedRows, query]);
+
+  // helpers
+  const asNum = (v: any): number | null =>
+    v == null || v === "" || Number.isNaN(Number(v)) ? null : Number(v);
+
+  const totalFor = (emp: Employee, h1?: number, h2?: number): number => {
+    const lr = asNum(emp.labor_rate);
+    const a = asNum(h1) || 0;
+    const b = asNum(h2) || 0;
+    return lr == null ? 0 : lr * (a + b);
   };
 
-  // Commit numeric edits for week1/week2
-  const handleCellEditStop = React.useCallback(
-    (params: GridCellEditStopParams, reason: GridCellEditStopReasons) => {
-      if (
-        reason !== GridCellEditStopReasons.enterKeyDown &&
-        reason !== GridCellEditStopReasons.cellFocusOut
-      ) {
-        return;
-      }
-      const { id, field } = params;
-      if (field !== "week1" && field !== "week2") return;
+  const handleHoursChange = (id: string, key: "w1" | "w2", value: string) => {
+    const n = value === "" ? undefined : Number(value);
+    setHours((prev) => ({ ...prev, [id]: { ...prev[id], [key]: n } }));
+  };
 
-      const newValue = Number(params.value);
-      setRows((prev) =>
-        prev.map((r) =>
-          r.employee_id === id
-            ? {
-                ...r,
-                [field]: isFinite(newValue) ? newValue : 0,
-              }
-            : r
-        )
-      );
-    },
-    []
-  );
+  // edit dialog functions
+  const openEdit = (emp: Employee) => {
+    setForm({ ...emp });
+    setError(null);
+    setOpen(true);
+  };
 
-  // Filter on text fields
-  const filtered = React.useMemo(() => {
-    if (!search.trim()) return rows;
-    const q = search.trim().toLowerCase();
-    return rows.filter((r) => {
-      const hay = [r.name, r.reference, r.company, r.location, r.position]
-        .filter(Boolean)
-        .join(" ")
-        .toLowerCase();
-      return hay.includes(q);
-    });
-  }, [rows, search]);
-
-  // NOTE: we cast (p as any) when reading p.row to avoid generic TS issues on CI.
-  const columns: GridColDef[] = [
-    { field: "reference", headerName: "Ref", minWidth: 110 },
-    { field: "company", headerName: "Company", minWidth: 130 },
-    { field: "location", headerName: "Location", minWidth: 120 },
-    { field: "position", headerName: "Position", minWidth: 140 },
-    {
-      field: "labor_rate",
-      headerName: "Rate",
-      minWidth: 110,
-      sortable: true,
-      valueGetter: (p) => Number((p as any).row?.labor_rate ?? 0),
-      valueFormatter: (p) => money(p.value as number),
-    },
-    {
-      field: "week1",
-      headerName: "Week 1",
-      type: "number",
-      minWidth: 110,
-      editable: true,
-      valueGetter: (p) => Number((p as any).row?.week1 ?? 0),
-    },
-    {
-      field: "week2",
-      headerName: "Week 2",
-      type: "number",
-      minWidth: 110,
-      editable: true,
-      valueGetter: (p) => Number((p as any).row?.week2 ?? 0),
-    },
-    {
-      field: "check",
-      headerName: "Check",
-      minWidth: 130,
-      sortable: false,
-      valueGetter: (p) => {
-        const rate = Number((p as any).row?.labor_rate ?? 0);
-        const w1 = Number((p as any).row?.week1 ?? 0);
-        const w2 = Number((p as any).row?.week2 ?? 0);
-        return (w1 + w2) * rate;
-      },
-      valueFormatter: (p) => money(p.value as number),
-    },
-  ];
-
-  // Export only rows with hours to CSV
-  const exportCSV = React.useCallback(() => {
-    const withHours = rows.filter(
-      (r) => (Number(r.week1) || 0) > 0 || (Number(r.week2) || 0) > 0
-    );
-    if (withHours.length === 0) {
-      alert("No rows with hours to export.");
-      return;
+  const saveEdit = async () => {
+    setSaving(true);
+    try {
+      const payload: any = { ...form };
+      const id = payload.employee_id;
+      if (!id) throw new Error("Missing employee_id");
+      payload.labor_rate =
+        payload.labor_rate === "" || payload.labor_rate == null
+          ? null
+          : Number(payload.labor_rate);
+      const { employee_id, ...rest } = payload;
+      const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(rest),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      setOpen(false);
+      fetchRows();
+    } catch (e: any) {
+      setError(e?.message || "Save failed");
+    } finally {
+      setSaving(false);
     }
+  };
 
+  // -------- CSV EXPORT (client-only) ----------
+  // Collect ANY employee (across the whole dataset) that has hours (w1 or w2) set.
+  const exportCSV = () => {
+    // Build a map for fast lookup of base employee info
+    const byId = new Map(allRows.map((r) => [r.employee_id, r]));
+
+    const lines: string[] = [];
     const headers = [
-      "employee_id",
-      "name",
-      "reference",
-      "company",
-      "location",
-      "position",
-      "labor_rate",
-      "week1",
-      "week2",
-      "check",
+      "EmployeeID",
+      "Name",
+      "Reference",
+      "Company",
+      "Location",
+      "Position",
+      "LaborRate",
+      "Week1Hours",
+      "Week2Hours",
+      "TotalHours",
+      "CheckTotal",
     ];
+    lines.push(headers.join(","));
 
-    const lines = [headers.join(",")];
+    // We export everyone present in the hours map who has w1 or w2 > 0
+    for (const [id, h] of Object.entries(hours)) {
+      const w1 = Number(h?.w1 ?? 0);
+      const w2 = Number(h?.w2 ?? 0);
+      if ((w1 || 0) <= 0 && (w2 || 0) <= 0) continue; // skip if no hours
 
-    for (const r of withHours) {
-      const rate = Number(r.labor_rate ?? 0);
-      const w1 = Number(r.week1 ?? 0);
-      const w2 = Number(r.week2 ?? 0);
-      const check = (w1 + w2) * rate;
+      const base = byId.get(id);
+      if (!base) continue; // safety
+
+      const rate = asNum(base.labor_rate) ?? 0;
+      const totalHours = w1 + w2;
+      const check = rate * totalHours;
 
       const row = [
-        r.employee_id ?? "",
-        quote(r.name),
-        quote(r.reference),
-        quote(r.company),
-        quote(r.location),
-        quote(r.position),
+        id,
+        csvQuote(base.name),
+        csvQuote(base.reference),
+        csvQuote(base.company),
+        csvQuote(base.location),
+        csvQuote(base.position),
         rate.toFixed(2),
         w1.toString(),
         w2.toString(),
+        totalHours.toString(),
         check.toFixed(2),
       ];
+
       lines.push(row.join(","));
+    }
+
+    if (lines.length === 1) {
+      alert("No hours to export. Enter Week 1 or Week 2 hours first.");
+      return;
     }
 
     const blob = new Blob([lines.join("\n")], {
@@ -220,52 +223,276 @@ export default function PayrollPage() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
-  }, [rows]);
+  };
+
+  // columns
+  const columns: GridColDef<Employee>[] = [
+    { field: "employee_id", headerName: "ID", minWidth: 110 },
+    { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
+    { field: "reference", headerName: "Ref", minWidth: 100 },
+    { field: "company", headerName: "Company", minWidth: 140 },
+    { field: "location", headerName: "Location", minWidth: 120 },
+    { field: "position", headerName: "Position", minWidth: 140 },
+    {
+      field: "labor_rate",
+      headerName: "Rate",
+      minWidth: 90,
+      renderCell: (p: any) => {
+        const v = asNum(p?.row?.labor_rate);
+        return v == null ? "-" : `$${v.toFixed(2)}`;
+      },
+    },
+    {
+      field: "w1",
+      headerName: "Week 1",
+      minWidth: 110,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => {
+        const id = p?.row?.employee_id as string | undefined;
+        const value = id ? hours[id]?.w1 ?? "" : "";
+        return (
+          <TextField
+            size="small"
+            type="number"
+            value={value}
+            onChange={(e) => id && handleHoursChange(id, "w1", e.target.value)}
+            sx={{ width: 100 }}
+          />
+        );
+      },
+    },
+    {
+      field: "w2",
+      headerName: "Week 2",
+      minWidth: 110,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => {
+        const id = p?.row?.employee_id as string | undefined;
+        const value = id ? hours[id]?.w2 ?? "" : "";
+        return (
+          <TextField
+            size="small"
+            type="number"
+            value={value}
+            onChange={(e) => id && handleHoursChange(id, "w2", e.target.value)}
+            sx={{ width: 100 }}
+          />
+        );
+      },
+    },
+    {
+      field: "check_total",
+      headerName: "Check Total",
+      minWidth: 140,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => {
+        const row = (p?.row ?? {}) as Employee;
+        const id = row.employee_id;
+        const h = (id && hours[id]) || {};
+        const total = totalFor(row, h?.w1, h?.w2);
+        return `$${total.toFixed(2)}`;
+      },
+    },
+    {
+      field: "actions",
+      headerName: "Edit",
+      width: 80,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => (
+        <IconButton
+          size="small"
+          onClick={() => p?.row && openEdit(p.row as Employee)}
+          aria-label="edit"
+        >
+          <EditIcon fontSize="small" />
+        </IconButton>
+      ),
+    },
+  ];
 
   return (
     <Stack gap={2}>
-      <Stack direction="row" alignItems="center" justifyContent="space-between" gap={2}>
-        <Typography variant="h5" fontWeight={600}>
+      {/* Header & Actions */}
+      <Stack direction="row" alignItems="center" justifyContent="space-between">
+        <Typography variant="h5" fontWeight={700}>
           Payroll
         </Typography>
-
-        <Box sx={{ flex: 1 }} />
-
-        <TextField
-          placeholder="Search by name, ref, company, location, position..."
-          size="small"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          sx={{ minWidth: 360 }}
-        />
-
-        <Button variant="contained" onClick={exportCSV}>
-          Save as CSV
-        </Button>
+        <Stack direction="row" gap={1}>
+          <Button
+            startIcon={<SaveAltIcon />}
+            variant="contained"
+            onClick={exportCSV}
+          >
+            Save as CSV
+          </Button>
+        </Stack>
       </Stack>
 
-      <Box sx={{ height: 680, width: "100%", bgcolor: "background.paper", borderRadius: 2, p: 1 }}>
-        <DataGrid
-          rows={filtered}
+      {/* Search + Filters */}
+      <Box
+        sx={{
+          p: 2,
+          background: "#fff",
+          border: "1px solid #e5e7eb",
+          borderRadius: 2,
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", sm: "2fr 1fr 1fr 1fr" },
+          gap: 2,
+        }}
+      >
+        <TextField
+          label="Search by name"
+          placeholder="Start typing a name…"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          size="small"
+        />
+
+        <FormControl size="small">
+          <InputLabel>Scope</InputLabel>
+          <Select
+            label="Scope"
+            value={scope}
+            onChange={(e) => setScope(e.target.value as "all" | "by")}
+            startAdornment={<FilterAltIcon sx={{ mr: 1 }} />}
+          >
+            <MenuItem value="all">All employees</MenuItem>
+            <MenuItem value="by">By company & location</MenuItem>
+          </Select>
+        </FormControl>
+
+        <FormControl size="small" disabled={scope === "all"}>
+          <InputLabel>Company</InputLabel>
+          <Select
+            label="Company"
+            value={company}
+            onChange={(e) => setCompany(e.target.value)}
+          >
+            {companies.map((c) => (
+              <MenuItem key={c} value={c}>
+                {c}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <FormControl size="small" disabled={scope === "all"}>
+          <InputLabel>Location</InputLabel>
+          <Select
+            label="Location"
+            value={location}
+            onChange={(e) => setLocation(e.target.value)}
+          >
+            {locations.map((l) => (
+              <MenuItem key={l} value={l}>
+                {l}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </Box>
+
+      {/* Grid */}
+      <Box sx={{ width: "100%", bgcolor: "background.paper", borderRadius: 2 }}>
+        <DataGrid<Employee>
+          rows={rows}
           columns={columns}
           getRowId={(r) => r.employee_id}
           loading={loading}
           disableRowSelectionOnClick
-          editMode="cell"
-          onCellEditStop={handleCellEditStop}
-          slots={{ toolbar: GridToolbar }}
           initialState={{
-            pagination: { paginationModel: { pageSize: 100, page: 0 } },
-            sorting: { sortModel: [{ field: "company", sort: "asc" }] },
+            pagination: { paginationModel: { pageSize: 25, page: 0 } },
+            sorting: { sortModel: [{ field: "name", sort: "asc" }] },
           }}
-          pageSizeOptions={[25, 50, 100]}
+          pageSizeOptions={[10, 25, 50, 100]}
+          sx={{
+            borderRadius: 2,
+            "& .MuiDataGrid-columnHeaders": {
+              background: "#f3f4f6",
+              fontWeight: 600,
+            },
+          }}
         />
       </Box>
+
+      {/* Edit dialog */}
+      <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Edit Employee</DialogTitle>
+        <DialogContent dividers>
+          <Box
+            sx={{
+              display: "grid",
+              gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
+              gap: 2,
+            }}
+          >
+            <TextField label="Employee ID" value={form.employee_id ?? ""} disabled />
+            <TextField
+              label="Name"
+              value={form.name ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
+            />
+            <TextField
+              label="Reference"
+              value={form.reference ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, reference: e.target.value }))
+              }
+            />
+            <TextField
+              label="Company"
+              value={form.company ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, company: e.target.value }))
+              }
+            />
+            <TextField
+              label="Location"
+              value={form.location ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, location: e.target.value }))
+              }
+            />
+            <TextField
+              label="Position"
+              value={form.position ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, position: e.target.value }))
+              }
+            />
+            <TextField
+              label="Phone"
+              value={form.phone ?? ""}
+              onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))}
+            />
+            <TextField
+              label="Labor Rate"
+              type="number"
+              value={form.labor_rate ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, labor_rate: e.target.value }))
+              }
+            />
+          </Box>
+          {error && <Typography color="error" sx={{ mt: 2 }}>{error}</Typography>}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpen(false)}>Cancel</Button>
+          <Button variant="contained" onClick={saveEdit} disabled={saving}>
+            {saving ? "Saving..." : "Save"}
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Stack>
   );
 }
 
-function quote(v: unknown): string {
+/** CSV quoting helper */
+function csvQuote(v: unknown): string {
   if (v === null || v === undefined) return "";
   const s = String(v);
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
