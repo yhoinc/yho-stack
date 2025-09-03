@@ -1,24 +1,28 @@
 "use client";
+
 import * as React from "react";
 import {
   Box,
   Button,
   Stack,
-  TextField,
   Typography,
 } from "@mui/material";
-import { DataGrid, GridColDef } from "@mui/x-data-grid";
+import {
+  DataGrid,
+  GridColDef,
+  GridRenderCellParams,
+} from "@mui/x-data-grid";
 
 type EmployeeRow = {
   employee_id: string;
   name: string;
-  reference?: string;
-  company?: string;
-  location?: string;
-  position?: string;
-  phone?: string;
-  labor_rate?: number | string;
-  per_diem?: number | string;
+  reference?: string | null;
+  company?: string | null;
+  location?: string | null;
+  position?: string | null;
+  phone?: string | null;
+  labor_rate?: number | string | null;
+  per_diem?: number | string | null;
   week1?: number;
   week2?: number;
 };
@@ -36,15 +40,14 @@ export default function PayrollPage() {
       const r = await fetch(`${API}/employees?limit=1000`);
       const d = await r.json();
       const raw: any[] = d?.rows ?? [];
-      // initialize week1 and week2
-      const withWeeks = raw.map((row) => ({
+      const withWeeks: EmployeeRow[] = raw.map((row) => ({
         ...row,
         week1: 0,
         week2: 0,
       }));
       setRows(withWeeks);
-    } catch (e) {
-      console.error("Could not load employees", e);
+    } catch (err) {
+      console.error("Could not load employees", err);
     } finally {
       setLoading(false);
     }
@@ -54,7 +57,10 @@ export default function PayrollPage() {
     fetchRows();
   }, [fetchRows]);
 
-  const columns: GridColDef[] = [
+  const moneyFmt = (v: unknown) =>
+    v == null || v === "" || Number.isNaN(Number(v)) ? "-" : `$${Number(v).toFixed(2)}`;
+
+  const columns: GridColDef<EmployeeRow>[] = [
     { field: "employee_id", headerName: "ID", width: 90 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 160 },
     { field: "reference", headerName: "Ref", width: 120 },
@@ -65,12 +71,8 @@ export default function PayrollPage() {
       field: "labor_rate",
       headerName: "Rate",
       width: 120,
-      renderCell: (params) => {
-        const v = params.row?.labor_rate;
-        return v == null || v === "" || Number.isNaN(Number(v))
-          ? "-"
-          : `$${Number(v).toFixed(2)}`;
-      },
+      renderCell: (params: GridRenderCellParams<EmployeeRow, EmployeeRow["labor_rate"]>) =>
+        moneyFmt(params.row?.labor_rate),
     },
     {
       field: "week1",
@@ -78,6 +80,11 @@ export default function PayrollPage() {
       width: 120,
       editable: true,
       type: "number",
+      valueSetter: (v) => {
+        // ensure numeric in state
+        const val = Number(v.value ?? 0);
+        return { ...v.row, week1: Number.isNaN(val) ? 0 : val };
+      },
     },
     {
       field: "week2",
@@ -85,16 +92,23 @@ export default function PayrollPage() {
       width: 120,
       editable: true,
       type: "number",
+      valueSetter: (v) => {
+        const val = Number(v.value ?? 0);
+        return { ...v.row, week2: Number.isNaN(val) ? 0 : val };
+      },
     },
     {
       field: "check",
       headerName: "Check",
       width: 150,
-      valueGetter: (params) => {
-        const rate = Number(params.row?.labor_rate || 0);
-        const w1 = Number(params.row?.week1 || 0);
-        const w2 = Number(params.row?.week2 || 0);
-        return `$${((w1 + w2) * rate).toFixed(2)}`;
+      sortable: false,
+      filterable: false,
+      renderCell: (params: GridRenderCellParams<EmployeeRow>) => {
+        const rate = Number(params.row?.labor_rate ?? 0);
+        const w1 = Number(params.row?.week1 ?? 0);
+        const w2 = Number(params.row?.week2 ?? 0);
+        const total = (w1 + w2) * (Number.isNaN(rate) ? 0 : rate);
+        return `$${total.toFixed(2)}`;
       },
     },
   ];
@@ -109,21 +123,21 @@ export default function PayrollPage() {
       return;
     }
 
-    // Build headers dynamically
+    // gather headers across all rows to include everything currently present
     const headers = Array.from(
-      eligible.reduce((set: Set<string>, row: Record<string, unknown>) => {
+      eligible.reduce((set: Set<string>, row) => {
         Object.keys(row).forEach((k) => set.add(k));
         return set;
       }, new Set<string>())
     );
 
-    const esc = (v: unknown) => {
-      const s = v == null ? "" : String(v);
+    const esc = (val: unknown) => {
+      const s = val == null ? "" : String(val);
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
 
     const lines: string[] = [];
-    lines.push(headers.join(","));
+    lines.push(headers.join(",")); // header row
     for (const row of eligible) {
       lines.push(headers.map((h) => esc((row as any)[h])).join(","));
     }
@@ -131,7 +145,6 @@ export default function PayrollPage() {
     const csv = lines.join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
-
     const a = document.createElement("a");
     a.href = url;
     const date = new Date().toISOString().slice(0, 10);
@@ -144,11 +157,7 @@ export default function PayrollPage() {
 
   return (
     <Stack gap={2}>
-      <Stack
-        direction="row"
-        alignItems="center"
-        justifyContent="space-between"
-      >
+      <Stack direction="row" alignItems="center" justifyContent="space-between">
         <Typography variant="h5" fontWeight={600}>
           Payroll
         </Typography>
@@ -166,7 +175,7 @@ export default function PayrollPage() {
           p: 1,
         }}
       >
-        <DataGrid
+        <DataGrid<EmployeeRow>
           rows={rows}
           columns={columns}
           getRowId={(r) => r.employee_id}
