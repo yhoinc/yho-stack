@@ -34,14 +34,7 @@ type Employee = {
   per_diem?: number | string | null; // rate per day
 };
 
-type HoursState = Record<
-  string,
-  {
-    w1?: number; // week 1 hours
-    w2?: number; // week 2 hours
-    days?: number; // total days worked in period (for per-diem)
-  }
->;
+type HoursMap = Record<string, { w1?: number; w2?: number; days?: number }>;
 
 export default function PayrollPage() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -57,10 +50,14 @@ export default function PayrollPage() {
   // search
   const [query, setQuery] = React.useState<string>("");
 
-  // hours keyed by employee_id (persist across filters/search)
-  const [hours, setHours] = React.useState<HoursState>({});
+  // user-entered hours/days
+  const [hours, setHours] = React.useState<HoursMap>({});
 
-  // dialog mode
+  // overtime settings (editable in UI)
+  const [otThreshold, setOtThreshold] = React.useState<number>(40); // weekly
+  const [otMultiplier, setOtMultiplier] = React.useState<number>(1.5);
+
+  // dialog state
   const [mode, setMode] = React.useState<"edit" | "create">("edit");
   const [open, setOpen] = React.useState(false);
   const [form, setForm] = React.useState<Partial<Employee>>({});
@@ -96,7 +93,7 @@ export default function PayrollPage() {
     return ["(any)", ...Array.from(s).sort()];
   }, [allRows]);
 
-  // base filtered set by scope/company/location
+  // scope + filters
   const scopedRows: Employee[] = React.useMemo(() => {
     if (scope === "all") return allRows;
     return allRows.filter(
@@ -108,7 +105,7 @@ export default function PayrollPage() {
     );
   }, [allRows, scope, company, location]);
 
-  // final rows: apply name search
+  // search
   const rows: Employee[] = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return scopedRows;
@@ -119,18 +116,38 @@ export default function PayrollPage() {
   const asNum = (v: any): number | null =>
     v == null || v === "" || Number.isNaN(Number(v)) ? null : Number(v);
 
-  const perDiemTotalFor = (emp: Employee, days?: number): number => {
-    const rate = asNum(emp.per_diem) ?? 0;
-    const d = asNum(days) ?? 0;
-    return rate * d;
-  };
+  function splitOvertime(h: number, threshold: number) {
+    const reg = Math.min(h, threshold);
+    const ot = Math.max(h - threshold, 0);
+    return { reg, ot };
+  }
 
-  const checkTotalFor = (emp: Employee, h1?: number, h2?: number): number => {
-    const lr = asNum(emp.labor_rate) ?? 0;
-    const a = asNum(h1) || 0;
-    const b = asNum(h2) || 0;
-    return lr * (a + b);
-  };
+  function hourlyTotals(emp: Employee, w1?: number, w2?: number) {
+    const rate = asNum(emp.labor_rate) ?? 0;
+    const t = Number(otThreshold) || 40;
+    const m = Number(otMultiplier) || 1.5;
+
+    const h1 = asNum(w1) || 0;
+    const h2 = asNum(w2) || 0;
+
+    const s1 = splitOvertime(h1, t);
+    const s2 = splitOvertime(h2, t);
+
+    const regHours = s1.reg + s2.reg;
+    const otHours = s1.ot + s2.ot;
+
+    const regPay = rate * regHours;
+    const otPay = rate * m * otHours;
+    const total = regPay + otPay;
+
+    return { regHours, otHours, regPay, otPay, total, rate, t, m, h1, h2 };
+  }
+
+  function perDiemTotal(emp: Employee, days?: number) {
+    const pdRate = asNum(emp.per_diem) ?? 0;
+    const d = asNum(days) ?? 0;
+    return pdRate * d;
+  }
 
   const handleHoursChange = (
     id: string,
@@ -170,7 +187,6 @@ export default function PayrollPage() {
     setSaving(true);
     try {
       const payload: any = { ...form };
-      // enforce numerics
       payload.labor_rate =
         payload.labor_rate === "" || payload.labor_rate == null
           ? null
@@ -211,8 +227,7 @@ export default function PayrollPage() {
     }
   };
 
-  // -------- CSV EXPORT (client-only) ----------
-  // Any employee who has hours (w1 or w2) OR days > 0 gets exported
+  // CSV export (includes OT breakdown + per-diem)
   const exportCSV = () => {
     const byId = new Map(allRows.map((r) => [r.employee_id, r]));
     const lines: string[] = [];
@@ -223,50 +238,66 @@ export default function PayrollPage() {
       "Company",
       "Location",
       "Position",
-      "LaborRate",
-      "Week1Hours",
-      "Week2Hours",
-      "CheckTotal",
+      "Rate",
+      "W1_Hours",
+      "W2_Hours",
+      "RegHours",
+      "OTHours",
+      "RegPay",
+      "OTPay",
+      "HourlyTotal",
       "PerDiemRate",
       "Days",
       "PerDiemTotal",
+      "GrandTotal",
+      "OT_Threshold",
+      "OT_Multiplier",
     ];
     lines.push(headers.join(","));
 
+    let any = false;
     for (const [id, h] of Object.entries(hours)) {
       const w1 = Number(h?.w1 ?? 0);
       const w2 = Number(h?.w2 ?? 0);
       const days = Number(h?.days ?? 0);
-      if ((w1 || 0) <= 0 && (w2 || 0) <= 0 && (days || 0) <= 0) continue;
+      if (w1 <= 0 && w2 <= 0 && days <= 0) continue;
 
-      const base = byId.get(id);
-      if (!base) continue;
+      const emp = byId.get(id);
+      if (!emp) continue;
 
-      const rate = asNum(base.labor_rate) ?? 0;
-      const check = checkTotalFor(base, w1, w2);
-      const perRate = asNum(base.per_diem) ?? 0;
-      const perTotal = perRate * days;
+      any = true;
+      const ot = hourlyTotals(emp, w1, w2);
+      const pdRate = asNum(emp.per_diem) ?? 0;
+      const pdTotal = perDiemTotal(emp, days);
+      const grand = ot.total + pdTotal;
 
       const row = [
         id,
-        csvQuote(base.name),
-        csvQuote(base.reference),
-        csvQuote(base.company),
-        csvQuote(base.location),
-        csvQuote(base.position),
-        rate.toFixed(2),
+        csvQuote(emp.name),
+        csvQuote(emp.reference),
+        csvQuote(emp.company),
+        csvQuote(emp.location),
+        csvQuote(emp.position),
+        ot.rate.toFixed(2),
         w1.toString(),
         w2.toString(),
-        check.toFixed(2),
-        perRate.toFixed(2),
+        ot.regHours.toFixed(2),
+        ot.otHours.toFixed(2),
+        ot.regPay.toFixed(2),
+        ot.otPay.toFixed(2),
+        ot.total.toFixed(2),
+        pdRate.toFixed(2),
         days.toString(),
-        perTotal.toFixed(2),
+        pdTotal.toFixed(2),
+        grand.toFixed(2),
+        ot.t.toString(),
+        ot.m.toString(),
       ];
 
       lines.push(row.join(","));
     }
 
-    if (lines.length === 1) {
+    if (!any) {
       alert("No hours/days to export. Enter Week 1 / Week 2 hours or Days first.");
       return;
     }
@@ -284,8 +315,8 @@ export default function PayrollPage() {
     URL.revokeObjectURL(url);
   };
 
-  // columns
-  const columns: GridColDef<Employee>[] = [
+  // columns (kept loose-typed to avoid TS “never/row” issues)
+  const columns: GridColDef[] = [
     { field: "employee_id", headerName: "ID", minWidth: 110 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
     { field: "reference", headerName: "Ref", minWidth: 100 },
@@ -343,20 +374,20 @@ export default function PayrollPage() {
     },
     {
       field: "check_total",
-      headerName: "Check Total",
-      minWidth: 130,
+      headerName: "Hourly Check (incl. OT)",
+      minWidth: 170,
       sortable: false,
       filterable: false,
       renderCell: (p: any) => {
-        const row = (p?.row ?? {}) as Employee;
-        const id = row.employee_id;
+        const emp = (p?.row ?? {}) as Employee;
+        const id = emp.employee_id;
         const h = (id && hours[id]) || {};
-        const total = checkTotalFor(row, h?.w1, h?.w2);
-        return `$${total.toFixed(2)}`;
+        const ot = hourlyTotals(emp, h?.w1, h?.w2);
+        return `$${ot.total.toFixed(2)}`;
       },
     },
     {
-      field: "per_diem",
+      field: "per_diem_rate",
       headerName: "Per Diem Rate",
       minWidth: 130,
       renderCell: (p: any) => {
@@ -387,15 +418,30 @@ export default function PayrollPage() {
     {
       field: "per_diem_total",
       headerName: "Per Diem Total",
-      minWidth: 150,
+      minWidth: 140,
       sortable: false,
       filterable: false,
       renderCell: (p: any) => {
-        const row = (p?.row ?? {}) as Employee;
-        const id = row.employee_id;
+        const emp = (p?.row ?? {}) as Employee;
+        const id = emp.employee_id;
         const d = (id && hours[id]?.days) || 0;
-        const total = perDiemTotalFor(row, d);
+        const total = perDiemTotal(emp, d);
         return `$${total.toFixed(2)}`;
+      },
+    },
+    {
+      field: "grand_total",
+      headerName: "Grand Total",
+      minWidth: 140,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => {
+        const emp = (p?.row ?? {}) as Employee;
+        const id = emp.employee_id;
+        const h = (id && hours[id]) || {};
+        const ot = hourlyTotals(emp, h?.w1, h?.w2);
+        const pd = perDiemTotal(emp, h?.days);
+        return `$${(ot.total + pd).toFixed(2)}`;
       },
     },
     {
@@ -433,7 +479,7 @@ export default function PayrollPage() {
         </Stack>
       </Stack>
 
-      {/* Search + Filters */}
+      {/* Search + Filters + OT Settings */}
       <Box
         sx={{
           p: 2,
@@ -441,8 +487,12 @@ export default function PayrollPage() {
           border: "1px solid #e5e7eb",
           borderRadius: 2,
           display: "grid",
-          gridTemplateColumns: { xs: "1fr", sm: "2fr 1fr 1fr 1fr" },
+          gridTemplateColumns: {
+            xs: "1fr",
+            md: "2fr 1fr 1fr 1fr 120px 140px",
+          },
           gap: 2,
+          alignItems: "center",
         }}
       >
         <TextField
@@ -495,11 +545,26 @@ export default function PayrollPage() {
             ))}
           </Select>
         </FormControl>
+
+        <TextField
+          size="small"
+          label="OT threshold (hrs/wk)"
+          type="number"
+          value={otThreshold}
+          onChange={(e) => setOtThreshold(Number(e.target.value || 0))}
+        />
+        <TextField
+          size="small"
+          label="OT multiplier"
+          type="number"
+          value={otMultiplier}
+          onChange={(e) => setOtMultiplier(Number(e.target.value || 0))}
+        />
       </Box>
 
       {/* Grid */}
       <Box sx={{ width: "100%", bgcolor: "background.paper", borderRadius: 2 }}>
-        <DataGrid<Employee>
+        <DataGrid
           rows={rows}
           columns={columns}
           getRowId={(r) => r.employee_id}
@@ -522,9 +587,7 @@ export default function PayrollPage() {
 
       {/* Create/Edit dialog */}
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>
-          {mode === "create" ? "Add Employee" : "Edit Employee"}
-        </DialogTitle>
+        <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
         <DialogContent dividers>
           <Box
             sx={{
