@@ -19,6 +19,7 @@ import {
 import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
+import AddIcon from "@mui/icons-material/Add";
 import FilterAltIcon from "@mui/icons-material/FilterAlt";
 
 type Employee = {
@@ -30,8 +31,17 @@ type Employee = {
   phone?: string | null;
   position?: string | null;
   labor_rate?: number | string | null;
-  per_diem?: number | string | null;
+  per_diem?: number | string | null; // rate per day
 };
+
+type HoursState = Record<
+  string,
+  {
+    w1?: number; // week 1 hours
+    w2?: number; // week 2 hours
+    days?: number; // total days worked in period (for per-diem)
+  }
+>;
 
 export default function PayrollPage() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -48,11 +58,10 @@ export default function PayrollPage() {
   const [query, setQuery] = React.useState<string>("");
 
   // hours keyed by employee_id (persist across filters/search)
-  const [hours, setHours] = React.useState<
-    Record<string, { w1?: number; w2?: number }>
-  >({});
+  const [hours, setHours] = React.useState<HoursState>({});
 
-  // edit dialog
+  // dialog mode
+  const [mode, setMode] = React.useState<"edit" | "create">("edit");
   const [open, setOpen] = React.useState(false);
   const [form, setForm] = React.useState<Partial<Employee>>({});
   const [saving, setSaving] = React.useState(false);
@@ -110,42 +119,89 @@ export default function PayrollPage() {
   const asNum = (v: any): number | null =>
     v == null || v === "" || Number.isNaN(Number(v)) ? null : Number(v);
 
-  const totalFor = (emp: Employee, h1?: number, h2?: number): number => {
-    const lr = asNum(emp.labor_rate);
-    const a = asNum(h1) || 0;
-    const b = asNum(h2) || 0;
-    return lr == null ? 0 : lr * (a + b);
+  const perDiemTotalFor = (emp: Employee, days?: number): number => {
+    const rate = asNum(emp.per_diem) ?? 0;
+    const d = asNum(days) ?? 0;
+    return rate * d;
   };
 
-  const handleHoursChange = (id: string, key: "w1" | "w2", value: string) => {
+  const checkTotalFor = (emp: Employee, h1?: number, h2?: number): number => {
+    const lr = asNum(emp.labor_rate) ?? 0;
+    const a = asNum(h1) || 0;
+    const b = asNum(h2) || 0;
+    return lr * (a + b);
+  };
+
+  const handleHoursChange = (
+    id: string,
+    key: "w1" | "w2" | "days",
+    value: string
+  ) => {
     const n = value === "" ? undefined : Number(value);
     setHours((prev) => ({ ...prev, [id]: { ...prev[id], [key]: n } }));
   };
 
-  // edit dialog functions
+  // dialog helpers
   const openEdit = (emp: Employee) => {
+    setMode("edit");
     setForm({ ...emp });
     setError(null);
     setOpen(true);
   };
 
-  const saveEdit = async () => {
+  const openCreate = () => {
+    setMode("create");
+    setForm({
+      employee_id: "",
+      name: "",
+      reference: "",
+      company: "",
+      location: "",
+      position: "",
+      phone: "",
+      labor_rate: "",
+      per_diem: "",
+    });
+    setError(null);
+    setOpen(true);
+  };
+
+  const saveDialog = async () => {
     setSaving(true);
     try {
       const payload: any = { ...form };
-      const id = payload.employee_id;
-      if (!id) throw new Error("Missing employee_id");
+      // enforce numerics
       payload.labor_rate =
         payload.labor_rate === "" || payload.labor_rate == null
           ? null
           : Number(payload.labor_rate);
-      const { employee_id, ...rest } = payload;
-      const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(rest),
-      });
-      if (!res.ok) throw new Error(await res.text());
+      payload.per_diem =
+        payload.per_diem === "" || payload.per_diem == null
+          ? null
+          : Number(payload.per_diem);
+
+      if (mode === "create") {
+        if (!payload.employee_id || !payload.name) {
+          throw new Error("Employee ID and Name are required");
+        }
+        const res = await fetch(`${API}/employees`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(await res.text());
+      } else {
+        const id = payload.employee_id;
+        if (!id) throw new Error("Missing employee_id");
+        const { employee_id, ...rest } = payload;
+        const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(rest),
+        });
+        if (!res.ok) throw new Error(await res.text());
+      }
+
       setOpen(false);
       fetchRows();
     } catch (e: any) {
@@ -156,11 +212,9 @@ export default function PayrollPage() {
   };
 
   // -------- CSV EXPORT (client-only) ----------
-  // Collect ANY employee (across the whole dataset) that has hours (w1 or w2) set.
+  // Any employee who has hours (w1 or w2) OR days > 0 gets exported
   const exportCSV = () => {
-    // Build a map for fast lookup of base employee info
     const byId = new Map(allRows.map((r) => [r.employee_id, r]));
-
     const lines: string[] = [];
     const headers = [
       "EmployeeID",
@@ -172,23 +226,26 @@ export default function PayrollPage() {
       "LaborRate",
       "Week1Hours",
       "Week2Hours",
-      "TotalHours",
       "CheckTotal",
+      "PerDiemRate",
+      "Days",
+      "PerDiemTotal",
     ];
     lines.push(headers.join(","));
 
-    // We export everyone present in the hours map who has w1 or w2 > 0
     for (const [id, h] of Object.entries(hours)) {
       const w1 = Number(h?.w1 ?? 0);
       const w2 = Number(h?.w2 ?? 0);
-      if ((w1 || 0) <= 0 && (w2 || 0) <= 0) continue; // skip if no hours
+      const days = Number(h?.days ?? 0);
+      if ((w1 || 0) <= 0 && (w2 || 0) <= 0 && (days || 0) <= 0) continue;
 
       const base = byId.get(id);
-      if (!base) continue; // safety
+      if (!base) continue;
 
       const rate = asNum(base.labor_rate) ?? 0;
-      const totalHours = w1 + w2;
-      const check = rate * totalHours;
+      const check = checkTotalFor(base, w1, w2);
+      const perRate = asNum(base.per_diem) ?? 0;
+      const perTotal = perRate * days;
 
       const row = [
         id,
@@ -200,15 +257,17 @@ export default function PayrollPage() {
         rate.toFixed(2),
         w1.toString(),
         w2.toString(),
-        totalHours.toString(),
         check.toFixed(2),
+        perRate.toFixed(2),
+        days.toString(),
+        perTotal.toFixed(2),
       ];
 
       lines.push(row.join(","));
     }
 
     if (lines.length === 1) {
-      alert("No hours to export. Enter Week 1 or Week 2 hours first.");
+      alert("No hours/days to export. Enter Week 1 / Week 2 hours or Days first.");
       return;
     }
 
@@ -285,14 +344,57 @@ export default function PayrollPage() {
     {
       field: "check_total",
       headerName: "Check Total",
-      minWidth: 140,
+      minWidth: 130,
       sortable: false,
       filterable: false,
       renderCell: (p: any) => {
         const row = (p?.row ?? {}) as Employee;
         const id = row.employee_id;
         const h = (id && hours[id]) || {};
-        const total = totalFor(row, h?.w1, h?.w2);
+        const total = checkTotalFor(row, h?.w1, h?.w2);
+        return `$${total.toFixed(2)}`;
+      },
+    },
+    {
+      field: "per_diem",
+      headerName: "Per Diem Rate",
+      minWidth: 130,
+      renderCell: (p: any) => {
+        const v = asNum(p?.row?.per_diem);
+        return v == null ? "-" : `$${v.toFixed(2)}`;
+      },
+    },
+    {
+      field: "days",
+      headerName: "Days",
+      minWidth: 90,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => {
+        const id = p?.row?.employee_id as string | undefined;
+        const value = id ? hours[id]?.days ?? "" : "";
+        return (
+          <TextField
+            size="small"
+            type="number"
+            value={value}
+            onChange={(e) => id && handleHoursChange(id, "days", e.target.value)}
+            sx={{ width: 80 }}
+          />
+        );
+      },
+    },
+    {
+      field: "per_diem_total",
+      headerName: "Per Diem Total",
+      minWidth: 150,
+      sortable: false,
+      filterable: false,
+      renderCell: (p: any) => {
+        const row = (p?.row ?? {}) as Employee;
+        const id = row.employee_id;
+        const d = (id && hours[id]?.days) || 0;
+        const total = perDiemTotalFor(row, d);
         return `$${total.toFixed(2)}`;
       },
     },
@@ -322,11 +424,10 @@ export default function PayrollPage() {
           Payroll
         </Typography>
         <Stack direction="row" gap={1}>
-          <Button
-            startIcon={<SaveAltIcon />}
-            variant="contained"
-            onClick={exportCSV}
-          >
+          <Button startIcon={<AddIcon />} variant="outlined" onClick={openCreate}>
+            Add Employee
+          </Button>
+          <Button startIcon={<SaveAltIcon />} variant="contained" onClick={exportCSV}>
             Save as CSV
           </Button>
         </Stack>
@@ -419,9 +520,11 @@ export default function PayrollPage() {
         />
       </Box>
 
-      {/* Edit dialog */}
+      {/* Create/Edit dialog */}
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>Edit Employee</DialogTitle>
+        <DialogTitle>
+          {mode === "create" ? "Add Employee" : "Edit Employee"}
+        </DialogTitle>
         <DialogContent dividers>
           <Box
             sx={{
@@ -430,7 +533,14 @@ export default function PayrollPage() {
               gap: 2,
             }}
           >
-            <TextField label="Employee ID" value={form.employee_id ?? ""} disabled />
+            <TextField
+              label="Employee ID"
+              value={form.employee_id ?? ""}
+              disabled={mode === "edit"}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, employee_id: e.target.value }))
+              }
+            />
             <TextField
               label="Name"
               value={form.name ?? ""}
@@ -477,12 +587,20 @@ export default function PayrollPage() {
                 setForm((p) => ({ ...p, labor_rate: e.target.value }))
               }
             />
+            <TextField
+              label="Per Diem (per day)"
+              type="number"
+              value={form.per_diem ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, per_diem: e.target.value }))
+              }
+            />
           </Box>
           {error && <Typography color="error" sx={{ mt: 2 }}>{error}</Typography>}
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setOpen(false)}>Cancel</Button>
-          <Button variant="contained" onClick={saveEdit} disabled={saving}>
+          <Button variant="contained" onClick={saveDialog} disabled={saving}>
             {saving ? "Saving..." : "Save"}
           </Button>
         </DialogActions>
