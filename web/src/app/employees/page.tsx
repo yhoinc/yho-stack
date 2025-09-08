@@ -16,6 +16,7 @@ import {
 import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import AddIcon from "@mui/icons-material/Add";
+import DownloadIcon from "@mui/icons-material/Download";
 
 type Employee = {
   employee_id: string;
@@ -34,13 +35,16 @@ type Employee = {
   apartment_id?: string | null;
 };
 
-export default function EmployeesPage() {
+export default function EmployeesPage(): React.ReactElement {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
   const [rows, setRows] = React.useState<Employee[]>([]);
   const [loading, setLoading] = React.useState(false);
 
-  const [query, setQuery] = React.useState(""); // search
+  // search
+  const [query, setQuery] = React.useState("");
+
+  // dialog / form
   const [open, setOpen] = React.useState(false);
   const [mode, setMode] = React.useState<"create" | "edit">("create");
   const [form, setForm] = React.useState<Partial<Employee>>({});
@@ -50,7 +54,7 @@ export default function EmployeesPage() {
   const fetchRows = React.useCallback(async () => {
     setLoading(true);
     try {
-      const r = await fetch(`${API}/employees?limit=1000`);
+      const r = await fetch(`${API}/employees?limit=2000`);
       const d = await r.json();
       const raw: any[] = d?.rows ?? [];
       setRows(raw);
@@ -63,25 +67,44 @@ export default function EmployeesPage() {
     fetchRows();
   }, [fetchRows]);
 
-  const moneyFmt = (n: number | string | null | undefined) => {
-    const v = Number(n);
-    return Number.isFinite(v) ? `$${v.toFixed(2)}` : "-";
+  // ---------- helpers ----------
+  const asNumber = (v: unknown): number | null => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
   };
 
+  const money = (v: unknown): string => {
+    const n = asNumber(v);
+    return n == null ? "-" : `$${n.toFixed(2)}`;
+  };
+
+  // generate a compact unique ID on client for new employees
+  const makeEmployeeId = () =>
+    `E-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
+
+  // search across multiple fields
   const filteredRows = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return rows;
-    return rows.filter(
-      (r) =>
-        r.name?.toLowerCase().includes(q) ||
-        r.company?.toLowerCase().includes(q) ||
-        r.location?.toLowerCase().includes(q) ||
-        r.position?.toLowerCase().includes(q)
-    );
+    return rows.filter((r) => {
+      const hay = [
+        r.employee_id,
+        r.name,
+        r.reference,
+        r.company,
+        r.location,
+        r.position,
+        r.phone,
+      ]
+        .filter(Boolean)
+        .map((s) => String(s).toLowerCase());
+      return hay.some((s) => s.includes(q));
+    });
   }, [rows, query]);
 
+  // ---------- grid ----------
   const columns: GridColDef[] = [
-    { field: "employee_id", headerName: "ID", minWidth: 120 },
+    { field: "employee_id", headerName: "ID", minWidth: 140 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
     { field: "reference", headerName: "Ref", minWidth: 110 },
     { field: "company", headerName: "Company", minWidth: 140 },
@@ -92,15 +115,15 @@ export default function EmployeesPage() {
       field: "per_diem",
       headerName: "Per Diem",
       minWidth: 120,
-      renderCell: (p) => <span>{moneyFmt(p?.row?.per_diem)}</span>,
+      renderCell: (p) => <span>{money(p?.row?.per_diem)}</span>,
     },
     {
       field: "labor_rate",
       headerName: "Labor Rate",
       minWidth: 130,
-      renderCell: (params) => {
-        const v = params.row?.labor_rate ?? (params.row as any)?.pay_rate ?? null;
-        return <span>{moneyFmt(v)}</span>;
+      renderCell: (p) => {
+        const v = p?.row?.labor_rate ?? (p?.row as any)?.pay_rate ?? null;
+        return <span>{money(v)}</span>;
       },
     },
     {
@@ -121,10 +144,11 @@ export default function EmployeesPage() {
     },
   ];
 
+  // ---------- dialog handlers ----------
   function openCreate() {
     setMode("create");
     setForm({
-      employee_id: "",
+      employee_id: makeEmployeeId(),
       name: "",
       reference: "",
       company: "",
@@ -149,6 +173,8 @@ export default function EmployeesPage() {
     setSaving(true);
     try {
       const payload: any = { ...form };
+
+      // coerce numerics
       payload.labor_rate =
         payload.labor_rate === "" || payload.labor_rate == null
           ? null
@@ -170,6 +196,8 @@ export default function EmployeesPage() {
           body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error(await res.text());
+
+        // optimistic insert
         setRows((prev) => [{ ...payload }, ...prev]);
       } else {
         const id = payload.employee_id;
@@ -180,8 +208,10 @@ export default function EmployeesPage() {
           body: JSON.stringify(rest),
         });
         if (!res.ok) throw new Error(await res.text());
+
+        // optimistic update
         setRows((prev) =>
-          prev.map((r) => (r.employee_id === id ? { ...r, ...rest } : r))
+          prev.map((r) => (r.employee_id === id ? { ...r, ...rest } : r)),
         );
       }
 
@@ -193,8 +223,61 @@ export default function EmployeesPage() {
     }
   }
 
+  // ---------- CSV export (entire DB) ----------
+  const downloadCSV = () => {
+    // export the full database we have loaded (rows), not only the filtered view
+    const csvHeaders = [
+      "employee_id",
+      "name",
+      "reference",
+      "company",
+      "location",
+      "position",
+      "phone",
+      "per_diem",
+      "labor_rate",
+      "address",
+      "deduction",
+      "debt",
+      "payment_count",
+      "apartment_id",
+    ];
+
+    const escape = (v: unknown) => {
+      if (v == null) return "";
+      const s = String(v);
+      // quote if needed
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+
+    const lines = [
+      csvHeaders.join(","), // header
+      ...rows.map((r) =>
+        csvHeaders
+          .map((k) =>
+            k === "per_diem" || k === "labor_rate"
+              ? escape(asNumber((r as any)[k]) ?? "")
+              : escape((r as any)[k]),
+          )
+          .join(","),
+      ),
+    ];
+
+    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "employees_database.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  // ---------- UI ----------
   return (
     <Stack gap={2}>
+      {/* Header / Actions */}
       <Stack direction="row" alignItems="center" justifyContent="space-between">
         <Typography variant="h5" fontWeight={600}>
           Employees
@@ -202,20 +285,25 @@ export default function EmployeesPage() {
         <Stack direction="row" gap={1}>
           <TextField
             size="small"
-            placeholder="Search name, company, location, position…"
+            placeholder="Search name, company, location, position, phone, ref, or ID…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            sx={{ minWidth: 420 }}
           />
           <Button
-            variant="contained"
-            startIcon={<AddIcon />}
-            onClick={openCreate}
+            variant="outlined"
+            startIcon={<DownloadIcon />}
+            onClick={downloadCSV}
           >
+            Download CSV
+          </Button>
+          <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
             Add Employee
           </Button>
         </Stack>
       </Stack>
 
+      {/* Grid */}
       <Box
         sx={{
           height: 640,
@@ -239,8 +327,11 @@ export default function EmployeesPage() {
         />
       </Box>
 
+      {/* Dialog */}
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
+        <DialogTitle>
+          {mode === "create" ? "Add Employee" : "Edit Employee"}
+        </DialogTitle>
         <DialogContent dividers>
           <Box
             sx={{
@@ -252,8 +343,7 @@ export default function EmployeesPage() {
             <TextField
               label="Employee ID *"
               value={form.employee_id ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, employee_id: e.target.value }))}
-              disabled={mode === "edit"}
+              disabled // auto-generated on create; not editable
             />
             <TextField
               label="Name *"
@@ -263,7 +353,9 @@ export default function EmployeesPage() {
             <TextField
               label="Reference"
               value={form.reference ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, reference: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, reference: e.target.value }))
+              }
             />
             <TextField
               label="Company"
@@ -273,12 +365,16 @@ export default function EmployeesPage() {
             <TextField
               label="Location"
               value={form.location ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, location: e.target.value }))
+              }
             />
             <TextField
               label="Position"
               value={form.position ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, position: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, position: e.target.value }))
+              }
             />
             <TextField
               label="Phone"
@@ -289,13 +385,17 @@ export default function EmployeesPage() {
               label="Per Diem"
               type="number"
               value={form.per_diem ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, per_diem: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, per_diem: e.target.value }))
+              }
             />
             <TextField
               label="Labor Rate"
               type="number"
               value={form.labor_rate ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, labor_rate: e.target.value }))
+              }
             />
           </Box>
           {error && (
