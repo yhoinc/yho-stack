@@ -78,9 +78,19 @@ export default function EmployeesPage(): React.ReactElement {
     return n == null ? "-" : `$${n.toFixed(2)}`;
   };
 
-  // generate a compact unique ID on client for new employees
-  const makeEmployeeId = () =>
-    `E-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
+  // find the next employee ID
+  const nextEmployeeId = (): string => {
+    let maxNum = 0;
+    rows.forEach((r) => {
+      const m = /^E(\d{1,})$/.exec(r.employee_id || "");
+      if (m) {
+        const num = parseInt(m[1], 10);
+        if (num > maxNum) maxNum = num;
+      }
+    });
+    const next = maxNum + 1;
+    return `E${String(next).padStart(4, "0")}`;
+  };
 
   // search across multiple fields
   const filteredRows = React.useMemo(() => {
@@ -148,7 +158,7 @@ export default function EmployeesPage(): React.ReactElement {
   function openCreate() {
     setMode("create");
     setForm({
-      employee_id: makeEmployeeId(),
+      employee_id: nextEmployeeId(),
       name: "",
       reference: "",
       company: "",
@@ -225,7 +235,6 @@ export default function EmployeesPage(): React.ReactElement {
 
   // ---------- CSV export (entire DB) ----------
   const downloadCSV = () => {
-    // export the full database we have loaded (rows), not only the filtered view
     const csvHeaders = [
       "employee_id",
       "name",
@@ -246,12 +255,11 @@ export default function EmployeesPage(): React.ReactElement {
     const escape = (v: unknown) => {
       if (v == null) return "";
       const s = String(v);
-      // quote if needed
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
 
     const lines = [
-      csvHeaders.join(","), // header
+      csvHeaders.join(","),
       ...rows.map((r) =>
         csvHeaders
           .map((k) =>
@@ -340,11 +348,7 @@ export default function EmployeesPage(): React.ReactElement {
               gap: 2,
             }}
           >
-            <TextField
-              label="Employee ID *"
-              value={form.employee_id ?? ""}
-              disabled // auto-generated on create; not editable
-            />
+            <TextField label="Employee ID *" value={form.employee_id ?? ""} disabled />
             <TextField
               label="Name *"
               value={form.name ?? ""}
@@ -353,9 +357,7 @@ export default function EmployeesPage(): React.ReactElement {
             <TextField
               label="Reference"
               value={form.reference ?? ""}
-              onChange={(e) =>
-                setForm((p) => ({ ...p, reference: e.target.value }))
-              }
+              onChange={(e) => setForm((p) => ({ ...p, reference: e.target.value }))}
             />
             <TextField
               label="Company"
@@ -365,16 +367,12 @@ export default function EmployeesPage(): React.ReactElement {
             <TextField
               label="Location"
               value={form.location ?? ""}
-              onChange={(e) =>
-                setForm((p) => ({ ...p, location: e.target.value }))
-              }
+              onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))}
             />
             <TextField
               label="Position"
               value={form.position ?? ""}
-              onChange={(e) =>
-                setForm((p) => ({ ...p, position: e.target.value }))
-              }
+              onChange={(e) => setForm((p) => ({ ...p, position: e.target.value }))}
             />
             <TextField
               label="Phone"
@@ -385,17 +383,13 @@ export default function EmployeesPage(): React.ReactElement {
               label="Per Diem"
               type="number"
               value={form.per_diem ?? ""}
-              onChange={(e) =>
-                setForm((p) => ({ ...p, per_diem: e.target.value }))
-              }
+              onChange={(e) => setForm((p) => ({ ...p, per_diem: e.target.value }))}
             />
             <TextField
               label="Labor Rate"
               type="number"
               value={form.labor_rate ?? ""}
-              onChange={(e) =>
-                setForm((p) => ({ ...p, labor_rate: e.target.value }))
-              }
+              onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
             />
           </Box>
           {error && (
