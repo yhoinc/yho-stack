@@ -1,4 +1,5 @@
 "use client";
+
 import * as React from "react";
 import {
   Box,
@@ -35,37 +36,9 @@ type Employee = {
 
 export default function EmployeesPage() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+
   const [rows, setRows] = React.useState<Employee[]>([]);
   const [loading, setLoading] = React.useState(false);
-
-  // search state (local filter of loaded rows)
-  const [query, setQuery] = React.useState("");
-  const [debounced, setDebounced] = React.useState(query);
-  React.useEffect(() => {
-    const id = window.setTimeout(() => setDebounced(query.trim().toLowerCase()), 250);
-    return () => window.clearTimeout(id);
-  }, [query]);
-
-  const filteredRows = React.useMemo(() => {
-    if (!debounced) return rows;
-    const pick = (v: unknown) => (v == null ? "" : String(v).toLowerCase());
-    return rows.filter((r) => {
-      const hay =
-        [
-          r.employee_id,
-          r.name,
-          r.reference,
-          r.company,
-          r.location,
-          r.position,
-          r.phone,
-          r.address,
-        ]
-          .map(pick)
-          .join(" ") || "";
-      return hay.includes(debounced);
-    });
-  }, [rows, debounced]);
 
   const [open, setOpen] = React.useState(false);
   const [mode, setMode] = React.useState<"create" | "edit">("create");
@@ -79,7 +52,7 @@ export default function EmployeesPage() {
       const r = await fetch(`${API}/employees?limit=1000`);
       const d = await r.json();
       const raw: any[] = d?.rows ?? [];
-      setRows(raw); // trust backend values
+      setRows(raw);
     } finally {
       setLoading(false);
     }
@@ -89,17 +62,13 @@ export default function EmployeesPage() {
     fetchRows();
   }, [fetchRows]);
 
-  const moneyFmt = (p: any) => {
-    const v = p?.value;
-    return v == null || v === "" || Number.isNaN(Number(v))
-      ? "-"
-      : `$${Number(v).toFixed(2)}`;
+  const moneyFmt = (n: number | string | null | undefined) => {
+    const v = Number(n);
+    return Number.isFinite(v) ? `$${v.toFixed(2)}` : "-";
   };
-  const numFmt = (p: any) => {
-    const v = p?.value;
-    return v == null || v === "" || Number.isNaN(Number(v))
-      ? "-"
-      : Number(v).toFixed(2);
+  const numFmt = (n: number | string | null | undefined) => {
+    const v = Number(n);
+    return Number.isFinite(v) ? v.toFixed(2) : "-";
   };
 
   const columns: GridColDef[] = [
@@ -110,7 +79,14 @@ export default function EmployeesPage() {
     { field: "location", headerName: "Location", minWidth: 120 },
     { field: "position", headerName: "Position", minWidth: 140 },
     { field: "phone", headerName: "Phone", minWidth: 150 },
-    { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
+    // Per Diem shown as currency; robust to string/number/null
+    {
+      field: "per_diem",
+      headerName: "Per Diem",
+      minWidth: 120,
+      sortable: true,
+      renderCell: (p) => <span>{moneyFmt(p?.row?.per_diem)}</span>,
+    },
     {
       field: "labor_rate",
       headerName: "Labor Rate",
@@ -118,8 +94,7 @@ export default function EmployeesPage() {
       sortable: true,
       renderCell: (params) => {
         const v = params.row?.labor_rate ?? (params.row as any)?.pay_rate ?? null;
-        if (v == null || v === "" || Number.isNaN(Number(v))) return "-";
-        return `$${Number(v).toFixed(2)}`;
+        return <span>{moneyFmt(v)}</span>;
       },
     },
     {
@@ -129,7 +104,11 @@ export default function EmployeesPage() {
       filterable: false,
       width: 100,
       renderCell: (params) => (
-        <IconButton size="small" onClick={() => openEdit(params.row as Employee)} aria-label="edit">
+        <IconButton
+          size="small"
+          onClick={() => openEdit(params.row as Employee)}
+          aria-label="edit"
+        >
           <EditIcon fontSize="small" />
         </IconButton>
       ),
@@ -164,11 +143,16 @@ export default function EmployeesPage() {
     setSaving(true);
     try {
       const payload: any = { ...form };
-      // coerce numerics if provided
+
+      // coerce numerics
       payload.labor_rate =
-        payload.labor_rate === "" || payload.labor_rate == null ? null : Number(payload.labor_rate);
+        payload.labor_rate === "" || payload.labor_rate == null
+          ? null
+          : Number(payload.labor_rate);
       payload.per_diem =
-        payload.per_diem === "" || payload.per_diem == null ? null : Number(payload.per_diem);
+        payload.per_diem === "" || payload.per_diem == null
+          ? null
+          : Number(payload.per_diem);
 
       if (mode === "create") {
         if (!payload.employee_id || !payload.name) {
@@ -182,18 +166,32 @@ export default function EmployeesPage() {
           body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error(await res.text());
+
+        // optimistic add
+        setRows((prev) => [{ ...payload }, ...prev]);
       } else {
         const id = payload.employee_id;
         const { employee_id, ...rest } = payload;
+
         const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(rest),
         });
         if (!res.ok) throw new Error(await res.text());
+
+        // optimistic update (includes per_diem/labor_rate)
+        setRows((prev) =>
+          prev.map((r) =>
+            r.employee_id === id ? { ...r, ...rest } : r
+          )
+        );
       }
+
       setOpen(false);
-      await fetchRows();
+
+      // optional: refresh from server for full fidelity (runs in background)
+      fetchRows();
     } catch (e: any) {
       setError(e?.message || "Save failed");
     } finally {
@@ -203,33 +201,26 @@ export default function EmployeesPage() {
 
   return (
     <Stack gap={2}>
-      {/* Header row with search and add */}
-      <Stack
-        direction={{ xs: "column", sm: "row" }}
-        alignItems={{ sm: "center" }}
-        justifyContent="space-between"
-        gap={1}
-      >
+      <Stack direction="row" alignItems="center" justifyContent="space-between">
         <Typography variant="h5" fontWeight={600}>
           Employees
         </Typography>
-        <Stack direction="row" gap={1} alignItems="center" sx={{ width: { xs: "100%", sm: "auto" } }}>
-          <TextField
-            size="small"
-            placeholder="Search name, company, location, position…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            sx={{ width: { xs: "100%", sm: 360 } }}
-          />
-          <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-            Add Employee
-          </Button>
-        </Stack>
+        <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
+          Add Employee
+        </Button>
       </Stack>
 
-      <Box sx={{ height: 640, width: "100%", bgcolor: "background.paper", borderRadius: 2, p: 1 }}>
+      <Box
+        sx={{
+          height: 640,
+          width: "100%",
+          bgcolor: "background.paper",
+          borderRadius: 2,
+          p: 1,
+        }}
+      >
         <DataGrid
-          rows={filteredRows}
+          rows={rows}
           columns={columns}
           getRowId={(r) => r.employee_id}
           loading={loading}
@@ -246,7 +237,7 @@ export default function EmployeesPage() {
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
         <DialogContent dividers>
-          {/* simple 2-column responsive form without MUI Grid to avoid TS issues */}
+          {/* simple responsive 2-col form */}
           <Box
             sx={{
               display: "grid",
