@@ -13,7 +13,7 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
-import { DataGrid, GridColDef, GridToolbar } from "@mui/x-data-grid";
+import { DataGrid, GridColDef } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import AddIcon from "@mui/icons-material/Add";
 
@@ -40,6 +40,7 @@ export default function EmployeesPage() {
   const [rows, setRows] = React.useState<Employee[]>([]);
   const [loading, setLoading] = React.useState(false);
 
+  const [query, setQuery] = React.useState(""); // search
   const [open, setOpen] = React.useState(false);
   const [mode, setMode] = React.useState<"create" | "edit">("create");
   const [form, setForm] = React.useState<Partial<Employee>>({});
@@ -66,10 +67,18 @@ export default function EmployeesPage() {
     const v = Number(n);
     return Number.isFinite(v) ? `$${v.toFixed(2)}` : "-";
   };
-  const numFmt = (n: number | string | null | undefined) => {
-    const v = Number(n);
-    return Number.isFinite(v) ? v.toFixed(2) : "-";
-  };
+
+  const filteredRows = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return rows;
+    return rows.filter(
+      (r) =>
+        r.name?.toLowerCase().includes(q) ||
+        r.company?.toLowerCase().includes(q) ||
+        r.location?.toLowerCase().includes(q) ||
+        r.position?.toLowerCase().includes(q)
+    );
+  }, [rows, query]);
 
   const columns: GridColDef[] = [
     { field: "employee_id", headerName: "ID", minWidth: 120 },
@@ -79,19 +88,16 @@ export default function EmployeesPage() {
     { field: "location", headerName: "Location", minWidth: 120 },
     { field: "position", headerName: "Position", minWidth: 140 },
     { field: "phone", headerName: "Phone", minWidth: 150 },
-    // Per Diem shown as currency; robust to string/number/null
     {
       field: "per_diem",
       headerName: "Per Diem",
       minWidth: 120,
-      sortable: true,
       renderCell: (p) => <span>{moneyFmt(p?.row?.per_diem)}</span>,
     },
     {
       field: "labor_rate",
       headerName: "Labor Rate",
       minWidth: 130,
-      sortable: true,
       renderCell: (params) => {
         const v = params.row?.labor_rate ?? (params.row as any)?.pay_rate ?? null;
         return <span>{moneyFmt(v)}</span>;
@@ -143,8 +149,6 @@ export default function EmployeesPage() {
     setSaving(true);
     try {
       const payload: any = { ...form };
-
-      // coerce numerics
       payload.labor_rate =
         payload.labor_rate === "" || payload.labor_rate == null
           ? null
@@ -166,32 +170,22 @@ export default function EmployeesPage() {
           body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error(await res.text());
-
-        // optimistic add
         setRows((prev) => [{ ...payload }, ...prev]);
       } else {
         const id = payload.employee_id;
         const { employee_id, ...rest } = payload;
-
         const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
           method: "PATCH",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(rest),
         });
         if (!res.ok) throw new Error(await res.text());
-
-        // optimistic update (includes per_diem/labor_rate)
         setRows((prev) =>
-          prev.map((r) =>
-            r.employee_id === id ? { ...r, ...rest } : r
-          )
+          prev.map((r) => (r.employee_id === id ? { ...r, ...rest } : r))
         );
       }
 
       setOpen(false);
-
-      // optional: refresh from server for full fidelity (runs in background)
-      fetchRows();
     } catch (e: any) {
       setError(e?.message || "Save failed");
     } finally {
@@ -205,9 +199,21 @@ export default function EmployeesPage() {
         <Typography variant="h5" fontWeight={600}>
           Employees
         </Typography>
-        <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
-          Add Employee
-        </Button>
+        <Stack direction="row" gap={1}>
+          <TextField
+            size="small"
+            placeholder="Search name, company, location, position…"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+          />
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={openCreate}
+          >
+            Add Employee
+          </Button>
+        </Stack>
       </Stack>
 
       <Box
@@ -220,12 +226,11 @@ export default function EmployeesPage() {
         }}
       >
         <DataGrid
-          rows={rows}
+          rows={filteredRows}
           columns={columns}
           getRowId={(r) => r.employee_id}
           loading={loading}
           disableRowSelectionOnClick
-          slots={{ toolbar: GridToolbar }}
           initialState={{
             pagination: { paginationModel: { pageSize: 25, page: 0 } },
             sorting: { sortModel: [{ field: "name", sort: "asc" }] },
@@ -237,13 +242,11 @@ export default function EmployeesPage() {
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
         <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
         <DialogContent dividers>
-          {/* simple responsive 2-col form */}
           <Box
             sx={{
               display: "grid",
               gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
               gap: 2,
-              mt: 0,
             }}
           >
             <TextField
