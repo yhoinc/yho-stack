@@ -9,6 +9,7 @@ import { DataGrid, GridColDef, GridRenderCellParams } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import FilterAltIcon from "@mui/icons-material/FilterAlt";
+import UploadFileIcon from "@mui/icons-material/UploadFile";
 
 type Employee = {
   employee_id: string;
@@ -20,8 +21,10 @@ type Employee = {
   position?: string | null;
   labor_rate?: number | string | null;
   per_diem?: number | string | null;
-  timesheet_name?: string | null;
 };
+
+type MatchedRow = { employee_id: string; name: string; hours: number };
+type UnmatchedRow = { name: string; reason: string; hours: number | null };
 
 export default function PayrollPage() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
@@ -37,7 +40,7 @@ export default function PayrollPage() {
   // search
   const [query, setQuery] = React.useState<string>("");
 
-  // hours keyed by employee_id
+  // hours keyed by employee_id (persist across filters/search)
   const [hours, setHours] = React.useState<Record<string, { w1?: number; w2?: number }>>({});
 
   // edit dialog
@@ -46,16 +49,13 @@ export default function PayrollPage() {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  // fetch employees
+  // Fetch employees
   const fetchRows = React.useCallback(async () => {
     setLoading(true);
     try {
       const r = await fetch(`${API}/employees?limit=2000`);
-      if (!r.ok) throw new Error(await r.text());
       const d = await r.json();
       setAllRows((d?.rows ?? []) as Employee[]);
-    } catch (e) {
-      console.error(e);
     } finally {
       setLoading(false);
     }
@@ -93,10 +93,13 @@ export default function PayrollPage() {
   }, [scopedRows, query]);
 
   // helpers
-  const asNum = (v: unknown): number | null =>
-    v == null || v === "" || Number.isNaN(Number(v)) ? null : Number(v);
+  const asNum = (v: unknown): number | null => {
+    if (v == null) return null;
+    const n = Number(v as any);
+    return Number.isNaN(n) ? null : n;
+  };
 
-  const money = (n: number): string => `$${(n || 0).toFixed(2)}`;
+  const money = (n: number): string => `$${n.toFixed(2)}`;
 
   const totalFor = (emp: Employee, h1?: number, h2?: number): number => {
     const lr = asNum(emp.labor_rate);
@@ -139,27 +142,63 @@ export default function PayrollPage() {
     } finally { setSaving(false); }
   };
 
-  // ------- Upload timesheet -> fill Week1; download unmatched CSV -------
-  const fileRef = React.useRef<HTMLInputElement | null>(null);
-  const triggerUpload = () => fileRef.current?.click();
-
-  const downloadCSV = (rows: Array<Record<string, unknown>>, name = "unmatched.csv") => {
-    if (!rows.length) return;
-    const headers = Object.keys(rows[0]);
-    const lines = [
+  // CSV download helper
+  const downloadCSV = (rows: Record<string, unknown>[], filename: string) => {
+    const headers = Object.keys(rows[0] || {});
+    const csv = [
       headers.join(","),
-      ...rows.map(r => headers.map(h => JSON.stringify(r[h] ?? "")).join(",")),
+      ...rows.map(r => headers.map(h => {
+        const val = r[h];
+        const s = val == null ? "" : String(val);
+        // escape quotes / commas
+        if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+        return s;
+      }).join(","))
     ].join("\n");
-    const blob = new Blob([lines], { type: "text/csv;charset=utf-8" });
+
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = name;
-    document.body.appendChild(a);
+    a.download = filename;
     a.click();
-    a.remove();
     URL.revokeObjectURL(url);
   };
+
+  // Save current visible set with hours to CSV
+  const saveAsCSV = () => {
+    const items = rows
+      .map((r) => {
+        const h = hours[r.employee_id] || {};
+        const h1 = asNum(h.w1) || 0;
+        const h2 = asNum(h.w2) || 0;
+        const rate = asNum(r.labor_rate) ?? 0;
+        return {
+          EmployeeID: r.employee_id,
+          Name: r.name ?? "",
+          Reference: r.reference ?? "",
+          Company: r.company ?? "",
+          Location: r.location ?? "",
+          Position: r.position ?? "",
+          LaborRate: rate,
+          Week1Hours: h1,
+          Week2Hours: h2,
+          TotalHours: h1 + h2,
+          CheckTotal: rate * (h1 + h2),
+        };
+      })
+      .filter(rec => (rec.Week1Hours || rec.Week2Hours)); // include only employees with any hours entered
+
+    if (!items.length) {
+      alert("No hours entered to export.");
+      return;
+    }
+    downloadCSV(items as any[], "payroll.csv");
+  };
+
+  // upload timesheet -> fill week1 hours; download unmatched
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const triggerUpload = () => fileInputRef.current?.click();
 
   const onUploadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
@@ -169,77 +208,34 @@ export default function PayrollPage() {
       fd.append("file", f);
       const res = await fetch(`${API}/timesheet/parse`, { method: "POST", body: fd });
       if (!res.ok) throw new Error(await res.text());
-      const data = await res.json() as {
-        matched: Array<{ employee_id: string; name: string; hours: number }>;
-        unmatched: Array<{ name: string; reason: string; hours: number | null }>;
-      };
+      const data = await res.json() as { matched: MatchedRow[]; unmatched: UnmatchedRow[] };
 
-      // merge hours into Week 1
+      console.log("timesheet.parse ->", data);
+
+      // merge into Week 1 by employee_id
       setHours(prev => {
         const next = { ...prev };
         for (const m of data.matched) {
-          const id = m.employee_id;
-          const curr = next[id] || {};
-          next[id] = { ...curr, w1: m.hours };
+          if (!m.employee_id) continue;
+          const curr = next[m.employee_id] || {};
+          next[m.employee_id] = { ...curr, w1: Number(m.hours || 0) };
         }
         return next;
       });
 
       if (data.unmatched?.length) {
         downloadCSV(
-          data.unmatched.map(u => ({ name: u.name, reason: u.reason, hours: u.hours ?? "" })),
+          data.unmatched.map(u => ({ name: u.name, reason: u.reason, hours: u.hours ?? "" })) as any[],
           "unmatched.csv"
         );
       }
-      alert(`Timesheet processed. Matched ${data.matched.length} employees${data.unmatched.length ? `, ${data.unmatched.length} unmatched (downloaded).` : "."}`);
+      alert(`Timesheet processed. Matched ${data.matched.length}${data.unmatched.length ? `, ${data.unmatched.length} unmatched (downloaded).` : "."}`);
     } catch (err: any) {
-      alert(`Timesheet parse failed: ${err?.message || err}`);
+      alert(`Upload failed: ${err?.message || err}`);
     } finally {
-      // reset the input so re-uploading same file works
-      e.target.value = "";
+      // clear input so selecting the same file again still triggers change
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
-  };
-
-  // Save as CSV of the *visible* set with hours
-  const saveAsCSV = () => {
-    const visible = rows.map((r) => {
-      const h = hours[r.employee_id] || {};
-      const h1 = asNum(h.w1) || 0;
-      const h2 = asNum(h.w2) || 0;
-      const rate = asNum(r.labor_rate) ?? 0;
-      return {
-        EmployeeID: r.employee_id,
-        Name: r.name ?? "",
-        Reference: r.reference ?? "",
-        Company: r.company ?? "",
-        Location: r.location ?? "",
-        Position: r.position ?? "",
-        LaborRate: rate,
-        Week1Hours: h1,
-        Week2Hours: h2,
-        TotalHours: h1 + h2,
-        CheckTotal: rate * (h1 + h2),
-      };
-    });
-
-    if (!visible.length) {
-      alert("No rows to export.");
-      return;
-    }
-    const headers = Object.keys(visible[0]);
-    const csv = [
-      headers.join(","),
-      ...visible.map(r => headers.map(h => JSON.stringify((r as any)[h] ?? "")).join(",")),
-    ].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "payroll.csv";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
   };
 
   // columns
@@ -255,8 +251,8 @@ export default function PayrollPage() {
       headerName: "Rate",
       minWidth: 90,
       renderCell: (p: GridRenderCellParams<Employee, unknown>) => {
-        const v = asNum(p?.row?.labor_rate);
-        return v == null ? "-" : `$${v.toFixed(2)}`;
+        const v = asNum(p.row?.labor_rate);
+        return v == null ? "-" : money(v);
       },
     },
     {
@@ -266,7 +262,7 @@ export default function PayrollPage() {
       sortable: false,
       filterable: false,
       renderCell: (p: GridRenderCellParams<Employee, unknown>) => {
-        const id = p?.row?.employee_id as string | undefined;
+        const id = p.row?.employee_id as string | undefined;
         const value = id ? hours[id]?.w1 ?? "" : "";
         return (
           <TextField
@@ -286,7 +282,7 @@ export default function PayrollPage() {
       sortable: false,
       filterable: false,
       renderCell: (p: GridRenderCellParams<Employee, unknown>) => {
-        const id = p?.row?.employee_id as string | undefined;
+        const id = p.row?.employee_id as string | undefined;
         const value = id ? hours[id]?.w2 ?? "" : "";
         return (
           <TextField
@@ -306,7 +302,7 @@ export default function PayrollPage() {
       sortable: false,
       filterable: false,
       renderCell: (p: GridRenderCellParams<Employee, unknown>) => {
-        const row = (p?.row ?? {}) as Employee;
+        const row = p.row as Employee;
         const id = row.employee_id;
         const h = (id && hours[id]) || {};
         const total = totalFor(row, h?.w1, h?.w2);
@@ -320,7 +316,11 @@ export default function PayrollPage() {
       sortable: false,
       filterable: false,
       renderCell: (p: GridRenderCellParams<Employee, unknown>) => (
-        <IconButton size="small" onClick={() => p?.row && openEdit(p.row as Employee)} aria-label="edit">
+        <IconButton
+          size="small"
+          onClick={() => p?.row && openEdit(p.row as Employee)}
+          aria-label="edit"
+        >
           <EditIcon fontSize="small" />
         </IconButton>
       ),
@@ -333,16 +333,16 @@ export default function PayrollPage() {
       <Stack direction="row" alignItems="center" justifyContent="space-between">
         <Typography variant="h5" fontWeight={700}>Payroll</Typography>
         <Stack direction="row" gap={1}>
-          <Button variant="outlined" onClick={triggerUpload}>
-            Upload Timesheet
-          </Button>
           <input
-            ref={fileRef}
+            ref={fileInputRef}
             type="file"
-            accept=".xls,.xlsx,.csv"
-            hidden
+            accept=".xlsx,.xls"
+            style={{ display: "none" }}
             onChange={onUploadFile}
           />
+          <Button startIcon={<UploadFileIcon />} variant="outlined" onClick={triggerUpload}>
+            Upload Timesheet (Excel)
+          </Button>
           <Button startIcon={<SaveAltIcon />} variant="contained" onClick={saveAsCSV}>
             Save as CSV
           </Button>
