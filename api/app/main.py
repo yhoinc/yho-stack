@@ -12,6 +12,8 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
+# ----- Excel parsing -----
+import pandas as pd
 
 # =============================================================================
 # Config
@@ -63,7 +65,57 @@ def open_db() -> sqlite3.Connection:
         raise FileNotFoundError(f"DB not found at {DB_PATH}")
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
     return conn
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    # Runs header
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS payroll_runs (
+        run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_key      TEXT UNIQUE,
+        created_at   TEXT DEFAULT (datetime('now')),
+        scope        TEXT,
+        company      TEXT,
+        location     TEXT,
+        note         TEXT
+    );
+    """)
+    # Items (one per employee in the run)
+    conn.execute("""
+    CREATE TABLE IF NOT_EXISTS payroll_items (
+        item_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id       INTEGER NOT NULL,
+        employee_id  TEXT,
+        name         TEXT,
+        timesheet_name TEXT,
+        reference    TEXT,
+        company      TEXT,
+        location     TEXT,
+        position     TEXT,
+        labor_rate   REAL,
+        per_diem     REAL,
+        week1_hours  REAL,
+        week2_hours  REAL,
+        days         REAL,
+        wages_total  REAL,   -- labor_rate * (w1 + w2)
+        perdiem_total REAL,  -- per_diem * days
+        total_out    REAL,   -- wages_total + perdiem_total
+        FOREIGN KEY(run_id) REFERENCES payroll_runs(run_id)
+    );
+    """.replace("NOT_EXISTS","NOT EXISTS"))
+    # Commissions (per run)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS payroll_commissions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id        INTEGER NOT NULL,
+        beneficiary   TEXT,   -- e.g. 'danny'
+        per_hour_rate REAL,   -- 0.50
+        source_hours  REAL,   -- sum of hours from items
+        total_commission REAL,
+        FOREIGN KEY(run_id) REFERENCES payroll_runs(run_id)
+    );
+    """)
 
 def list_tables(conn: sqlite3.Connection) -> List[str]:
     t = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -80,26 +132,19 @@ def first_table_with_column(conn: sqlite3.Connection, colname: str) -> Optional[
     return None
 
 def discover_employee_table(conn: sqlite3.Connection) -> Tuple[str, List[str]]:
-    """
-    Prefer a table literally named 'employees', else any table with 'employee_id' column,
-    else the first table found.
-    """
     tables = list_tables(conn)
     if not tables:
         raise RuntimeError("No tables found in SQLite DB.")
 
-    # Prefer exact 'employees'
     for t in tables:
         if t.lower() == "employees":
             cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{t}')").fetchall()]
             return t, cols
 
-    # Else table with employee_id
     found = first_table_with_column(conn, "employee_id")
     if found:
         return found
 
-    # Else first table
     tname = tables[0]
     cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
     return tname, cols
@@ -135,28 +180,6 @@ def filter_payload_to_table(payload: Dict[str, Any], columns: List[str]) -> Dict
             else:
                 out[k] = v
     return out
-
-
-# =============================================================================
-# Startup migration: ensure quickbooks_name column exists
-# =============================================================================
-def ensure_quickbooks_name_column():
-    """Ensure employees table has a TEXT column 'quickbooks_name'."""
-    with open_db() as conn:
-        tname, _cols = discover_employee_table(conn)
-        colnames = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
-        if "quickbooks_name" not in colnames:
-            conn.execute(f"ALTER TABLE '{tname}' ADD COLUMN quickbooks_name TEXT")
-            conn.commit()
-            print(f"[startup] Added quickbooks_name column to {tname}")
-
-@app.on_event("startup")
-def _startup_migrations():
-    try:
-        ensure_quickbooks_name_column()
-    except Exception as e:
-        # Non-fatal; surface by log only
-        print(f"[startup] ensure_quickbooks_name_column error: {e}")
 
 
 # =============================================================================
@@ -237,7 +260,277 @@ def patch_employee(employee_id: str, payload: Dict[str, Any]):
 
 
 # =============================================================================
-# Documents (S3-compatible). If not configured, returns empty list for /documents.
+# Payroll runs (persist for reports)
+# =============================================================================
+def _new_run_key(conn: sqlite3.Connection) -> str:
+    # cheap unique key: RUNyyyymmddHHMMSS_rowid
+    rowid = conn.execute("SELECT IFNULL(MAX(run_id),0)+1 AS n FROM payroll_runs").fetchone()["n"]
+    key = conn.execute("SELECT strftime('%Y%m%d%H%M%S','now')").fetchone()[0]
+    return f"RUN{key}_{rowid}"
+
+@app.post("/payroll/runs")
+def save_payroll_run(payload: Dict[str, Any]):
+    """
+    payload: {
+      scope, company, location, note,
+      items: [{employee_id,name,reference,company,location,position,labor_rate,per_diem,week1_hours,week2_hours,days}],
+      commission: { beneficiary: "danny", per_hour_rate: 0.50 }
+    }
+    """
+    try:
+        with open_db() as conn:
+            cur = conn.cursor()
+            run_key = _new_run_key(conn)
+            cur.execute(
+                "INSERT INTO payroll_runs(run_key,scope,company,location,note) VALUES(?,?,?,?,?)",
+                (run_key, payload.get("scope"), payload.get("company"), payload.get("location"), payload.get("note")),
+            )
+            run_id = cur.lastrowid
+
+            items = payload.get("items") or []
+            total_hours = 0.0
+            for it in items:
+                lr = to_float(it.get("labor_rate")) or 0.0
+                pd = to_float(it.get("per_diem")) or 0.0
+                w1 = to_float(it.get("week1_hours")) or 0.0
+                w2 = to_float(it.get("week2_hours")) or 0.0
+                days = to_float(it.get("days")) or 0.0
+                hours = (w1 + w2)
+                wages_total = lr * hours
+                perdiem_total = pd * days
+                total_out = wages_total + perdiem_total
+                total_hours += hours
+
+                cur.execute("""
+                INSERT INTO payroll_items(
+                    run_id, employee_id, name, timesheet_name, reference, company, location, position,
+                    labor_rate, per_diem, week1_hours, week2_hours, days,
+                    wages_total, perdiem_total, total_out
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    run_id,
+                    it.get("employee_id"), it.get("name"), it.get("timesheet_name"),
+                    it.get("reference"), it.get("company"), it.get("location"), it.get("position"),
+                    lr, pd, w1, w2, days, wages_total, perdiem_total, total_out
+                ))
+
+            # Commission: fixed rule 0.50 per hour for "danny"
+            c = payload.get("commission") or {}
+            rate = to_float(c.get("per_hour_rate")) or 0.50
+            beneficiary = (c.get("beneficiary") or "danny").strip().lower()  # store lowercased
+            total_commission = rate * total_hours
+            cur.execute("""
+                INSERT INTO payroll_commissions(run_id, beneficiary, per_hour_rate, source_hours, total_commission)
+                VALUES(?,?,?,?,?)
+            """, (run_id, beneficiary, rate, total_hours, total_commission))
+
+            conn.commit()
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "run_key": run_key,
+                "commission": {
+                    "beneficiary": beneficiary,
+                    "per_hour_rate": rate,
+                    "source_hours": total_hours,
+                    "total_commission": total_commission,
+                },
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Reports
+# =============================================================================
+@app.get("/reports/runs")
+def list_runs(limit: int = 50):
+    with open_db() as conn:
+        rs = conn.execute("""
+            SELECT r.run_id, r.run_key, r.created_at, r.scope, r.company, r.location,
+                   c.total_commission, c.source_hours, c.per_hour_rate
+            FROM payroll_runs r
+            LEFT JOIN payroll_commissions c ON c.run_id = r.run_id
+            ORDER BY r.run_id DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        return {"rows": [dict_from_row(r) for r in rs]}
+
+@app.get("/reports/summary")
+def summary(
+    date_from: Optional[str] = None,  # "YYYY-MM-DD"
+    date_to: Optional[str] = None     # "YYYY-MM-DD"
+):
+    """
+    Aggregates across saved runs. If dates are provided, filter by created_at (inclusive).
+    Returns:
+      { by_company: [...], by_employee: [...] }
+    """
+    with open_db() as conn:
+        where = []
+        params: List[Any] = []
+        if date_from:
+            where.append("date(r.created_at) >= date(?)")
+            params.append(date_from)
+        if date_to:
+            where.append("date(r.created_at) <= date(?)")
+            params.append(date_to)
+        W = "WHERE " + " AND ".join(where) if where else ""
+
+        by_company = conn.execute(f"""
+            SELECT
+                COALESCE(i.company,'(none)') AS company,
+                ROUND(SUM(i.week1_hours + i.week2_hours), 2)     AS hours,
+                ROUND(SUM(i.wages_total), 2)                     AS wages,
+                ROUND(SUM(i.perdiem_total), 2)                   AS per_diem,
+                ROUND(SUM(i.total_out), 2)                       AS grand_total
+            FROM payroll_items i
+            JOIN payroll_runs r ON r.run_id = i.run_id
+            {W}
+            GROUP BY COALESCE(i.company,'(none)')
+            ORDER BY company
+        """, params).fetchall()
+
+        by_employee = conn.execute(f"""
+            SELECT
+                i.employee_id,
+                i.name,
+                COALESCE(i.company,'(none)') AS company,
+                COALESCE(i.location,'')      AS location,
+                ROUND(SUM(i.week1_hours + i.week2_hours), 2)     AS hours,
+                ROUND(SUM(i.wages_total), 2)                     AS wages,
+                ROUND(SUM(i.perdiem_total), 2)                   AS per_diem,
+                ROUND(SUM(i.total_out), 2)                       AS grand_total
+            FROM payroll_items i
+            JOIN payroll_runs r ON r.run_id = i.run_id
+            {W}
+            GROUP BY i.employee_id, i.name, i.company, i.location
+            ORDER BY i.name
+        """, params).fetchall()
+
+        # Commission total for 'danny'
+        commission = conn.execute(f"""
+            SELECT
+                ROUND(SUM(c.total_commission), 2) AS total_commission,
+                ROUND(SUM(c.source_hours), 2)     AS hours,
+                MAX(c.per_hour_rate)              AS per_hour_rate
+            FROM payroll_commissions c
+            JOIN payroll_runs r ON r.run_id = c.run_id
+            {W}
+            AND LOWER(c.beneficiary) = 'danny'
+        """.replace("WHERE AND", "WHERE"), params).fetchone()
+
+        return {
+            "by_company": [dict_from_row(r) for r in by_company],
+            "by_employee": [dict_from_row(r) for r in by_employee],
+            "commission": dict_from_row(commission) if commission else None,
+        }
+
+
+# =============================================================================
+# Timesheet parse (keeps your “Employee”/“Total Hours” row logic)
+# =============================================================================
+def _extract_pairs_from_excel(df: pd.DataFrame) -> List[Tuple[str, float]]:
+    """
+    Walk rows; when a cell contains 'Employee' on that row, capture the other
+    non-empty cell as the name. The subsequent row that contains 'Total Hours'
+    will have the hours value in the other non-empty cell.
+    Returns list of (name, hours).
+    """
+    pairs: List[Tuple[str, float]] = []
+    name: Optional[str] = None
+
+    def row_texts(series: pd.Series) -> List[str]:
+        vals = []
+        for v in series.tolist():
+            if pd.isna(v):
+                continue
+            s = str(v).strip()
+            if s:
+                vals.append(s)
+        return vals
+
+    for _, row in df.iterrows():
+        texts = row_texts(row)
+        if not texts:
+            continue
+        joined = " | ".join(texts).lower()
+
+        if "employee" in joined and name is None:
+            # The name is the other non-empty cell on the same row
+            if len(texts) >= 2:
+                # pick the cell that isn't the word Employee
+                options = [t for t in texts if "employee" not in t.lower()]
+                if options:
+                    name = options[0]
+            continue
+
+        if "total hours" in joined and name is not None:
+            # hours is the numeric on this row that isn't the literal label
+            hours_val: Optional[float] = None
+            for t in texts:
+                if t.lower().find("total hours") >= 0:
+                    continue
+                try:
+                    hours_val = float(str(t).replace(",", ""))
+                    break
+                except Exception:
+                    pass
+            if hours_val is not None:
+                pairs.append((name, hours_val))
+            name = None
+
+    return pairs
+
+@app.post("/timesheet/parse")
+async def parse_timesheet(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        # openpyxl for xlsx/xlsm; xlrd handles xls (installed in requirements)
+        try:
+            df = pd.read_excel(io.BytesIO(content), engine="openpyxl", header=None)
+        except Exception:
+            # retry as old xls
+            df = pd.read_excel(io.BytesIO(content), engine="xlrd", header=None)
+        pairs = _extract_pairs_from_excel(df)
+
+        # Map to employees by timesheet_name (case-insensitive, strip trailing "(123)")
+        with open_db() as conn:
+            tname, cols = discover_employee_table(conn)
+            ts_col = "timesheet_name" if "timesheet_name" in cols else "name"
+            rs = conn.execute(f"SELECT employee_id, {ts_col} AS tname FROM '{tname}'").fetchall()
+            book = []
+            for r in rs:
+                t = (r["tname"] or "").strip()
+                if t:
+                    book.append((r["employee_id"], t.lower()))
+
+        matched = []
+        unmatched = []
+        for raw_name, hours in pairs:
+            n = (raw_name or "").strip()
+            core = n
+            # drop trailing "(123)" if present
+            if core.endswith(")") and "(" in core:
+                core = core[:core.rfind("(")].strip()
+            key = core.lower()
+            found_id = None
+            for eid, tname_lc in book:
+                if tname_lc == key:
+                    found_id = eid
+                    break
+            if found_id:
+                matched.append({"employee_id": found_id, "name": core, "hours": hours})
+            else:
+                unmatched.append({"name": n, "reason": "No exact timesheet_name match", "hours": hours})
+
+        return {"matched": matched, "unmatched": unmatched}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# =============================================================================
+# Documents (S3-compatible)
 # =============================================================================
 def s3_client():
     if not (S3_HOST and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET):
@@ -271,7 +564,6 @@ def list_documents(limit: int = 500):
                 break
         return {"rows": rows, "total": len(rows)}
     except RuntimeError as e:
-        # not configured -> don't break the whole app
         return {"rows": [], "total": 0, "note": str(e)}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -289,7 +581,6 @@ async def upload_document(
         folder = (custom_type or doc_types or "misc").strip() or "misc"
         filename = file.filename or "upload.bin"
         key = f"{name_key}/{folder}/{filename}"
-
         body = await file.read()
         s3.put_object(
             Bucket=S3_BUCKET,
