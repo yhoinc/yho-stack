@@ -15,6 +15,7 @@ from botocore.exceptions import ClientError
 
 # ----- Excel parsing (for /timesheet/parse) -----
 from openpyxl import load_workbook
+import xlrd
 
 
 # =============================================================================
@@ -311,33 +312,57 @@ def download_document(key: str):
 def _norm_name(s: str) -> str:
     if s is None:
         return ""
-    # strip "(123)" suffixes and extra spaces; upper for case-insensitive compare
-    s = re.sub(r"\(\s*\d+\s*\)", "", s).strip()
-    # collapse internal whitespace
+    s = re.sub(r"\(\s*\d+\s*\)", "", s).strip()  # strip "(123)"
     s = re.sub(r"\s+", " ", s)
     return s.upper()
+
+def _as_hours(v) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        s = str(v).strip()
+        if s == "":
+            return None
+        s = s.replace(",", "")
+        return float(s)
+    except Exception:
+        return None
 
 @app.post("/timesheet/parse")
 async def parse_timesheet(file: UploadFile = File(...)):
     """
-    Parse Excel timesheet(s):
-      - For every cell that equals 'Total Hours', take the numeric cell immediately to its right.
-      - Walk upward to find the nearest 'name cell' (first non-empty string above or one col left).
-      - Normalize the found name (strip '(###)', trim, collapse spaces, uppercase).
-      - Map to employees by `timesheet_name` first, then fallback to `name`.
-    Returns:
-      {
-        matched: [{employee_id, name, hours}],
-        unmatched: [{name, reason, hours}]
-      }
+    Supports .xlsx/.xlsm via openpyxl and .xls via xlrd.
+    Looks for 'Total Hours' cells, grabs the numeric cell to the right,
+    then walks upward to find the nearest name cell (same column or one to the left).
+    Matches employees by timesheet_name first, then name.
     """
+    # ----- read file bytes
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty upload")
+
+    # ----- load workbook according to magic header
+    # ZIP (xlsx/xlsm): PK\x03\x04 ; OLE (xls): D0 CF 11 E0 (hex)
+    is_zip = content[:4] == b"PK\x03\x04"
+    is_ole = content[:8] == b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+
+    wb_xlsx = None
+    wb_xls = None
     try:
-        content = await file.read()
-        wb = load_workbook(io.BytesIO(content), data_only=True)
+        if is_zip:
+            wb_xlsx = load_workbook(io.BytesIO(content), data_only=True)
+        elif is_ole:
+            wb_xls = xlrd.open_workbook(file_contents=content)
+        else:
+            # fallback try xlsx first then xls
+            try:
+                wb_xlsx = load_workbook(io.BytesIO(content), data_only=True)
+            except Exception:
+                wb_xls = xlrd.open_workbook(file_contents=content)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Could not read workbook: {e}")
 
-    # Load employees and build maps
+    # ----- load employees & maps
     try:
         with open_db() as conn:
             tname, _ = discover_employee_table(conn)
@@ -353,74 +378,74 @@ async def parse_timesheet(file: UploadFile = File(...)):
         if ts_name:
             by_timesheet[ts_name] = r
         nm = _norm_name(str(r.get("name") or ""))
-        if nm:
-            by_name.setdefault(nm, r)
+        if nm and nm not in by_name:
+            by_name[nm] = r
 
     matched: List[Dict[str, Any]] = []
     unmatched: List[Dict[str, Any]] = []
 
-    def _as_hours(v) -> Optional[float]:
-        if v is None:
-            return None
-        try:
-            s = str(v).strip()
-            if s == "":
-                return None
-            s = s.replace(",", "")
-            return float(s)
-        except Exception:
-            return None
+    def handle_hit(name_text: Optional[str], hours: Optional[float], where: str):
+        if not name_text:
+            unmatched.append({"name": "", "reason": f"Could not find name above {where}", "hours": hours})
+            return
+        key = _norm_name(name_text)
+        emp = by_timesheet.get(key) or by_name.get(key)
+        if emp:
+            eid = str(emp.get("employee_id") or "").strip()
+            disp = emp.get("name") or emp.get("timesheet_name") or name_text
+            matched.append({"employee_id": eid, "name": disp, "hours": hours or 0.0})
+        else:
+            unmatched.append({"name": name_text, "reason": "No matching employee by timesheet_name or name", "hours": hours})
 
-    for ws in wb.worksheets:
-        max_row = ws.max_row or 0
-        max_col = ws.max_column or 0
-
-        for row in range(1, max_row + 1):
-            for col in range(1, max_col + 1):
-                v = ws.cell(row=row, column=col).value
-                if isinstance(v, str) and v.strip().lower() == "total hours":
-                    hrs_val = ws.cell(row=row, column=col + 1).value if col + 1 <= max_col else None
-                    hours = _as_hours(hrs_val)
-
-                    # Find nearest name above (same column or one to the left)
-                    name_text: Optional[str] = None
-                    for rr in range(row - 1, 0, -1):
-                        val_same = ws.cell(rr, col).value
-                        if isinstance(val_same, str) and val_same.strip():
-                            name_text = val_same.strip()
-                            break
-                        if col - 1 >= 1:
-                            val_left = ws.cell(rr, col - 1).value
-                            if isinstance(val_left, str) and val_left.strip():
-                                name_text = val_left.strip()
+    # ----- iterate cells
+    if wb_xlsx is not None:
+        for ws in wb_xlsx.worksheets:
+            max_row = ws.max_row or 0
+            max_col = ws.max_column or 0
+            for r in range(1, max_row + 1):
+                for c in range(1, max_col + 1):
+                    v = ws.cell(row=r, column=c).value
+                    if isinstance(v, str) and v.strip().lower() == "total hours":
+                        hours = _as_hours(ws.cell(row=r, column=c + 1).value if c + 1 <= max_col else None)
+                        name_text: Optional[str] = None
+                        for rr in range(r - 1, 0, -1):
+                            val_same = ws.cell(rr, c).value
+                            if isinstance(val_same, str) and val_same.strip():
+                                name_text = val_same.strip()
                                 break
+                            if c - 1 >= 1:
+                                val_left = ws.cell(rr, c - 1).value
+                                if isinstance(val_left, str) and val_left.strip():
+                                    name_text = val_left.strip()
+                                    break
+                        handle_hit(name_text, hours, f"Total Hours at {ws.title} R{r}C{c}")
 
-                    if not name_text:
-                        unmatched.append({
-                            "name": "",
-                            "reason": f"Could not find name above Total Hours at {ws.title} R{row}C{col}",
-                            "hours": hours
-                        })
-                        continue
+    if wb_xls is not None:
+        for sheet in wb_xls.sheets():
+            nrows, ncols = sheet.nrows, sheet.ncols
+            for r in range(nrows):
+                for c in range(ncols):
+                    cell = sheet.cell(r, c)
+                    v = cell.value
+                    if isinstance(v, str) and v.strip().lower() == "total hours":
+                        hrs_val = sheet.cell(r, c + 1).value if c + 1 < ncols else None
+                        hours = _as_hours(hrs_val)
+                        name_text: Optional[str] = None
+                        rr = r - 1
+                        while rr >= 0:
+                            val_same = sheet.cell(rr, c).value
+                            if isinstance(val_same, str) and val_same.strip():
+                                name_text = val_same.strip()
+                                break
+                            if c - 1 >= 0:
+                                val_left = sheet.cell(rr, c - 1).value
+                                if isinstance(val_left, str) and val_left.strip():
+                                    name_text = val_left.strip()
+                                    break
+                            rr -= 1
+                        handle_hit(name_text, hours, f"Total Hours at {sheet.name} R{r}C{c}")
 
-                    key = _norm_name(name_text)
-                    emp = by_timesheet.get(key) or by_name.get(key)
-                    if emp:
-                        eid = str(emp.get("employee_id") or "").strip()
-                        disp = emp.get("name") or emp.get("timesheet_name") or name_text
-                        matched.append({
-                            "employee_id": eid,
-                            "name": disp,
-                            "hours": hours or 0.0
-                        })
-                    else:
-                        unmatched.append({
-                            "name": name_text,
-                            "reason": "No matching employee by timesheet_name or name",
-                            "hours": hours
-                        })
-
-    # Deduplicate by employee, prefer the largest hours
+    # Deduplicate by employee, keep the largest hours
     coalesced: Dict[str, Dict[str, Any]] = {}
     for m in matched:
         eid = m.get("employee_id") or ""
@@ -472,3 +497,4 @@ def debug_sample(limit: int = 3):
         for row in rows:
             row["labor_rate_display"] = compute_labor_rate_display(row)
         return {"table": tname, "rows": rows}
+
