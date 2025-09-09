@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import csv
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -8,14 +9,13 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-# ----- Optional S3 (R2 / Backblaze / Supabase-compatible) -----
+# S3 / R2 (unchanged)
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
-# ----- Excel parsing -----
+# NEW: excel/csv parsing
 import pandas as pd
-
 
 # =============================================================================
 # Config
@@ -26,7 +26,6 @@ os.makedirs(DATA_DIR, exist_ok=True)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "employees_with_company_v4.db")
 
-# S3-compatible object storage (optional)
 S3_ENDPOINT = (os.getenv("S3_ENDPOINT") or "").strip()
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")
@@ -43,7 +42,6 @@ def _normalize_endpoint(ep: str) -> str:
 
 S3_HOST = _normalize_endpoint(S3_ENDPOINT) if S3_ENDPOINT else ""
 
-
 # =============================================================================
 # App
 # =============================================================================
@@ -51,13 +49,12 @@ app = FastAPI(title="YHO API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tighten in prod
+    allow_origins=["*"],  # tighten in prod later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     max_age=600,
 )
-
 
 # =============================================================================
 # DB helpers
@@ -84,23 +81,16 @@ def first_table_with_column(conn: sqlite3.Connection, colname: str) -> Optional[
     return None
 
 def discover_employee_table(conn: sqlite3.Connection) -> Tuple[str, List[str]]:
-    """
-    Prefer a table literally named 'employees', else any table with 'employee_id' column,
-    else the first table found.
-    """
     tables = list_tables(conn)
     if not tables:
         raise RuntimeError("No tables found in SQLite DB.")
-
     for t in tables:
         if t.lower() == "employees":
             cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{t}')").fetchall()]
             return t, cols
-
     found = first_table_with_column(conn, "employee_id")
     if found:
         return found
-
     tname = tables[0]
     cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
     return tname, cols
@@ -136,7 +126,6 @@ def filter_payload_to_table(payload: Dict[str, Any], columns: List[str]) -> Dict
             else:
                 out[k] = v
     return out
-
 
 # =============================================================================
 # Employees
@@ -213,7 +202,6 @@ def patch_employee(employee_id: str, payload: Dict[str, Any]):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # =============================================================================
 # Documents (S3-compatible)
@@ -299,124 +287,124 @@ def download_document(key: str):
         code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
         raise HTTPException(status_code=code, detail=str(e))
 
-
 # =============================================================================
-# Timesheet upload → fill Week 1 hours
+# Timesheet Parsing (NEW)
 # =============================================================================
-NAME_RE = re.compile(r"\s*\(\d+\)\s*$")  # strip trailing " (123)"
-WS_RE = re.compile(r"\s+")
+_name_clean_re = re.compile(r"\s*\([^)]*\)\s*$")  # strip trailing " (123)"
 
-def norm_name(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).strip()
-    s = NAME_RE.sub("", s)
-    s = WS_RE.sub(" ", s)
-    return s
+def clean_timesheet_name(name: str) -> str:
+    s = _name_clean_re.sub("", name or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    return s.lower()
 
-def _read_any_excel(upload: UploadFile) -> pd.DataFrame:
-    data = upload.file.read()
-    upload.file.seek(0)
-    # Try xlsx first (openpyxl), then xls (xlrd)
-    try:
-        return pd.read_excel(io.BytesIO(data), header=None, engine="openpyxl")
-    except Exception:
-        return pd.read_excel(io.BytesIO(data), header=None, engine="xlrd")
+def find_total_hours_value(row: List[Any]) -> Optional[float]:
+    # Find "Total Hours" (case-insensitive substring). Then the first numeric cell to the right.
+    idx = None
+    for i, cell in enumerate(row):
+        if "total hours" in str(cell).strip().lower():
+            idx = i
+            break
+    if idx is None:
+        return None
+    for j in range(idx + 1, len(row)):
+        n = to_float(row[j])
+        if n is not None:
+            return n
+    return None
 
-def _rightmost_number(row_vals) -> Optional[float]:
-    num = None
-    for v in row_vals:
-        if isinstance(v, (int, float)):
-            num = float(v)
-        else:
-            s = str(v).strip().replace(",", "")
-            if s:
-                try:
-                    if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
-                        num = float(s)
-                except Exception:
-                    pass
-    return num
+def load_grid_from_upload(upload: UploadFile) -> List[List[Any]]:
+    content = upload.file.read()
+    fname = (upload.filename or "").lower()
+    if fname.endswith(".csv"):
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError:
+            text = content.decode("latin-1", errors="replace")
+        return [row for row in csv.reader(io.StringIO(text))]
+    # excel
+    with io.BytesIO(content) as bio:
+        if fname.endswith(".xls") or fname.endswith(".xlsx"):
+            df = pd.read_excel(bio, header=None)
+            return df.where(pd.notna(df), None).values.tolist()
+    raise HTTPException(status_code=400, detail="Unsupported file type. Use .csv, .xls, or .xlsx")
 
-@app.post("/payroll/timesheet/upload")
-async def upload_timesheet(file: UploadFile = File(...)):
+@app.post("/timesheet/parse")
+async def timesheet_parse(file: UploadFile = File(...)):
     """
-    Each employee block starts with a 'name' row (may include trailing '(123)').
-    Within the next ~10 rows there will be a row containing 'Total Hours' with
-    a numeric value to the right. That numeric is used as Week 1 hours.
-
-    Returns:
-      matches: [{employee_id, timesheet_name, week1_hours}]
-      unmatched: [{name, hours, reason}]
+    Scans the sheet linearly:
+      - If a row looks like an employee name, remember it as current_name
+      - The next row (or any following row) that contains 'Total Hours' gives the hours
+      - Emit pair (current_name -> hours), then clear current_name and continue
+    Matching to DB uses employees.timesheet_name (normalized).
     """
-    # 1) Load sheet
-    try:
-        df = _read_any_excel(file)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {e}")
+    grid = load_grid_from_upload(file)
 
-    # 2) Load DB mapping timesheet_name -> employee_id
+    # Build lookup: normalized timesheet_name -> employee
     with open_db() as conn:
         tname, cols = discover_employee_table(conn)
-        if "timesheet_name" not in cols:
-            raise HTTPException(status_code=400, detail="DB is missing 'timesheet_name' column.")
-        rs = conn.execute(f"SELECT employee_id, timesheet_name FROM '{tname}'").fetchall()
-        db_map = {norm_name(r["timesheet_name"]): r["employee_id"] for r in rs if r["timesheet_name"]}
+        has_timesheet_col = "timesheet_name" in [c.lower() for c in cols]
+        if not has_timesheet_col:
+            # fall back to name
+            rs = conn.execute(f"SELECT employee_id, name FROM '{tname}'").fetchall()
+            db_rows = [{"employee_id": r["employee_id"], "timesheet_name": (r["name"] or "")} for r in rs]
+        else:
+            rs = conn.execute(f"SELECT employee_id, name, timesheet_name FROM '{tname}'").fetchall()
+            db_rows = [dict_from_row(r) for r in rs]
 
-    values = df.fillna("").values.tolist()
-    nrows = len(values)
+    db_map: Dict[str, Dict[str, Any]] = {}
+    for r in db_rows:
+        key = clean_timesheet_name(str(r.get("timesheet_name") or r.get("name") or ""))
+        if key:
+            db_map[key] = r
 
-    matches: List[Dict[str, Any]] = []
+    def looks_like_name(row: List[Any]) -> Optional[str]:
+        # heuristic: a single non-empty string cell on the row; not "Total Hours"
+        non_empty = [str(c).strip() for c in row if c not in (None, "", "nan")]
+        if len(non_empty) != 1:
+            return None
+        s = non_empty[0]
+        if "total hours" in s.lower():
+            return None
+        # names tend to have a space; but allow single token too
+        return s
+
+    pairs: List[Tuple[str, Optional[float]]] = []
+    current_name: Optional[str] = None
+
+    for row in grid:
+        if current_name is None:
+            nm = looks_like_name(row)
+            if nm:
+                current_name = nm
+            continue
+        # we have a current name; look for the total row
+        hours = find_total_hours_value(row)
+        if hours is not None:
+            pairs.append((current_name, hours))
+            current_name = None
+
+    # If file ended with a dangling name that never got a Total Hours line,
+    # we can ignore or emit unmatched with reason.
     unmatched: List[Dict[str, Any]] = []
+    matched: List[Dict[str, Any]] = []
 
-    i = 0
-    while i < nrows:
-        row = values[i]
-        first_nonempty = next((str(c).strip() for c in row if str(c).strip() != ""), "")
-        # Looks like a person name?
-        if first_nonempty and re.fullmatch(r"[A-Za-z ,.'\-]+(?:\s*\(\d+\))?", first_nonempty):
-            name_raw = first_nonempty
-            name_key = norm_name(name_raw)
+    for nm, hrs in pairs:
+        key = clean_timesheet_name(nm)
+        emp = db_map.get(key)
+        if not emp:
+            unmatched.append({"name": nm, "reason": "No DB match", "hours": hrs})
+        else:
+            matched.append({
+                "employee_id": emp["employee_id"],
+                "name": emp.get("name") or nm,
+                "hours": hrs,
+            })
 
-            # look ahead up to 10 rows for 'Total Hours'
-            hours = None
-            for j in range(i + 1, min(i + 11, nrows)):
-                rowj = values[j]
-                has_total = any(isinstance(c, str) and "total hours" in c.lower() for c in rowj)
-                if has_total:
-                    hours = _rightmost_number(rowj)
-                    break
+    # If we had a name waiting without a total row:
+    if current_name:
+        unmatched.append({"name": current_name, "reason": "No 'Total Hours' row after name", "hours": None})
 
-            if name_key:
-                emp_id = db_map.get(name_key)
-                if emp_id and hours is not None:
-                    matches.append({
-                        "employee_id": emp_id,
-                        "timesheet_name": name_key,
-                        "week1_hours": float(hours),
-                    })
-                elif hours is not None:
-                    unmatched.append({
-                        "name": name_key,
-                        "hours": float(hours),
-                        "reason": "No DB match",
-                    })
-                else:
-                    unmatched.append({
-                        "name": name_key,
-                        "hours": None,
-                        "reason": "Total Hours not found",
-                    })
-        i += 1
-
-    return {
-        "matched_count": len(matches),
-        "unmatched_count": len(unmatched),
-        "matches": matches,
-        "unmatched": unmatched,
-    }
-
-
+    return {"matched": matched, "unmatched": unmatched}
 # =============================================================================
 # Debug / Health
 # =============================================================================
