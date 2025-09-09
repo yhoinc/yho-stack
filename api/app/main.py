@@ -1,9 +1,7 @@
 import os
 import io
 import re
-import csv
 import sqlite3
-import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
@@ -15,11 +13,8 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
-# Optional XLS/XLSX support (CSV works without these)
-try:
-    import pandas as pd  # type: ignore
-except Exception:
-    pd = None
+# ----- Excel parsing -----
+import pandas as pd
 
 
 # =============================================================================
@@ -97,18 +92,15 @@ def discover_employee_table(conn: sqlite3.Connection) -> Tuple[str, List[str]]:
     if not tables:
         raise RuntimeError("No tables found in SQLite DB.")
 
-    # Prefer exact 'employees'
     for t in tables:
         if t.lower() == "employees":
             cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{t}')").fetchall()]
             return t, cols
 
-    # Else table with employee_id
     found = first_table_with_column(conn, "employee_id")
     if found:
         return found
 
-    # Else first table
     tname = tables[0]
     cols = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
     return tname, cols
@@ -144,26 +136,6 @@ def filter_payload_to_table(payload: Dict[str, Any], columns: List[str]) -> Dict
             else:
                 out[k] = v
     return out
-
-
-# =============================================================================
-# Startup: ensure timesheet_name column exists (safe if already present)
-# =============================================================================
-def ensure_timesheet_name_column() -> None:
-    with open_db() as conn:
-        tname, _cols = discover_employee_table(conn)
-        existing = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
-        if "timesheet_name" not in existing:
-            conn.execute(f"ALTER TABLE '{tname}' ADD COLUMN timesheet_name TEXT")
-            # initialize to name for immediate matches
-            if "name" in existing:
-                conn.execute(f"UPDATE '{tname}' SET timesheet_name = COALESCE(timesheet_name, name) "
-                             f"WHERE timesheet_name IS NULL OR timesheet_name = ''")
-            conn.commit()
-
-@app.on_event("startup")
-def on_startup():
-    ensure_timesheet_name_column()
 
 
 # =============================================================================
@@ -244,150 +216,7 @@ def patch_employee(employee_id: str, payload: Dict[str, Any]):
 
 
 # =============================================================================
-# Timesheet upload/preview (auto-fill payroll)
-# =============================================================================
-
-# Normalize: lowercase, strip accents, collapse spaces, trim
-def _norm(s: Optional[str]) -> str:
-    if not s:
-        return ""
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-# Strip trailing " (12345)" (and any extra space before it)
-_PAREN_NUMBER_RE = re.compile(r"\s*\(\s*\d+\s*\)\s*$")
-
-def _strip_paren_number_suffix(s: str) -> str:
-    return _PAREN_NUMBER_RE.sub("", s or "")
-
-def _coerce_num(v: Any) -> float:
-    if v is None or v == "":
-        return 0.0
-    try:
-        s = str(v).strip().replace(",", "")
-        return float(s)
-    except Exception:
-        return 0.0
-
-# Column alias detection (case-insensitive)
-def _find_key(d: Dict[str, Any], candidates: List[str]) -> Optional[str]:
-    low = {k.lower(): k for k in d.keys()}
-    for c in candidates:
-        if c in low:
-            return low[c]
-    return None
-
-@app.post("/payroll/timesheet/preview")
-async def timesheet_preview(file: UploadFile = File(...)):
-    """
-    Upload a customer timesheet (CSV or XLS/XLSX if pandas is available).
-    Extract rows -> (name, week1_hours, week2_hours [optional]).
-    We strip trailing ' (12345)' from names before matching.
-
-    Returns:
-      {
-        "ok": true,
-        "matched": [{ employee_id, name, timesheet_name, week1_hours, week2_hours }],
-        "unmatched": [{ raw_name, week1_hours, week2_hours, reason }]
-      }
-    """
-    content = await file.read()
-    filename = (file.filename or "").lower()
-    rows: List[Dict[str, Any]] = []
-
-    # Parse file
-    if filename.endswith(".csv"):
-        try:
-            text = content.decode("utf-8", errors="ignore")
-            reader = csv.DictReader(io.StringIO(text))
-            rows = list(reader)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
-    elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-        if pd is None:
-            raise HTTPException(status_code=400, detail="XLS/XLSX requires pandas; please upload CSV or install pandas.")
-        try:
-            df = pd.read_excel(io.BytesIO(content))
-            rows = df.to_dict(orient="records")
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {e}")
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Upload CSV or XLS/XLSX.")
-
-    # Normalize and map columns
-    parsed: List[Dict[str, Any]] = []
-    for r in rows:
-        # Column aliases (case-insensitive)
-        name_key = _find_key(r, ["name", "employee", "worker", "full_name", "employee_name"])
-        w1_key   = _find_key(r, ["week1", "w1", "week 1", "wk1", "hours", "total", "regular", "reg"])
-        w2_key   = _find_key(r, ["week2", "w2", "week 2", "wk2"])
-
-        raw_name = str(r.get(name_key, "")).strip() if name_key else ""
-        raw_name = _strip_paren_number_suffix(raw_name)  # remove " (12345)"
-        week1 = _coerce_num(r.get(w1_key)) if w1_key else 0.0
-        week2 = _coerce_num(r.get(w2_key)) if w2_key else 0.0
-
-        if raw_name:
-            parsed.append({"raw_name": raw_name, "week1_hours": week1, "week2_hours": week2})
-
-    # Load employees
-    with open_db() as conn:
-        tname, _cols = discover_employee_table(conn)
-        employees = [dict_from_row(r) for r in conn.execute(f"SELECT * FROM '{tname}'").fetchall()]
-
-    # Build lookups: prefer timesheet_name; fallback to name
-    lookup: Dict[str, Dict[str, Any]] = {}
-    for e in employees:
-        tsn = _norm(_strip_paren_number_suffix(str(e.get("timesheet_name") or "")))
-        if tsn:
-            lookup[tsn] = e
-        nm = _norm(_strip_paren_number_suffix(str(e.get("name") or "")))
-        if nm and nm not in lookup:
-            lookup[nm] = e
-
-    matched: List[Dict[str, Any]] = []
-    unmatched: List[Dict[str, Any]] = []
-
-    # If multiple rows for same person in the sheet, sum them
-    accum: Dict[str, Dict[str, Any]] = {}
-    for pr in parsed:
-        key = _norm(pr["raw_name"])
-        if key not in accum:
-            accum[key] = {"raw_name": pr["raw_name"], "week1_hours": 0.0, "week2_hours": 0.0}
-        accum[key]["week1_hours"] += float(pr["week1_hours"])
-        accum[key]["week2_hours"] += float(pr["week2_hours"])
-
-    for key, pr in accum.items():
-        emp = lookup.get(key)
-        if emp:
-            matched.append({
-                "employee_id": emp.get("employee_id"),
-                "name": emp.get("name"),
-                "timesheet_name": emp.get("timesheet_name"),
-                "week1_hours": round(pr["week1_hours"], 2),
-                "week2_hours": round(pr["week2_hours"], 2),
-            })
-        else:
-            unmatched.append({
-                "raw_name": pr["raw_name"],
-                "week1_hours": round(pr["week1_hours"], 2),
-                "week2_hours": round(pr["week2_hours"], 2),
-                "reason": "No matching employee by timesheet_name/name",
-            })
-
-    return {
-        "ok": True,
-        "matched": matched,
-        "unmatched": unmatched,
-        "note": "Names are normalized and '(12345)' suffixes are ignored for matching.",
-    }
-
-
-# =============================================================================
-# Documents (S3-compatible). If not configured, returns empty list for /documents.
+# Documents (S3-compatible)
 # =============================================================================
 def s3_client():
     if not (S3_HOST and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET):
@@ -421,7 +250,6 @@ def list_documents(limit: int = 500):
                 break
         return {"rows": rows, "total": len(rows)}
     except RuntimeError as e:
-        # not configured -> don't break the whole app
         return {"rows": [], "total": 0, "note": str(e)}
     except ClientError as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -470,6 +298,123 @@ def download_document(key: str):
     except ClientError as e:
         code = e.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 500)
         raise HTTPException(status_code=code, detail=str(e))
+
+
+# =============================================================================
+# Timesheet upload → fill Week 1 hours
+# =============================================================================
+NAME_RE = re.compile(r"\s*\(\d+\)\s*$")  # strip trailing " (123)"
+WS_RE = re.compile(r"\s+")
+
+def norm_name(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s).strip()
+    s = NAME_RE.sub("", s)
+    s = WS_RE.sub(" ", s)
+    return s
+
+def _read_any_excel(upload: UploadFile) -> pd.DataFrame:
+    data = upload.file.read()
+    upload.file.seek(0)
+    # Try xlsx first (openpyxl), then xls (xlrd)
+    try:
+        return pd.read_excel(io.BytesIO(data), header=None, engine="openpyxl")
+    except Exception:
+        return pd.read_excel(io.BytesIO(data), header=None, engine="xlrd")
+
+def _rightmost_number(row_vals) -> Optional[float]:
+    num = None
+    for v in row_vals:
+        if isinstance(v, (int, float)):
+            num = float(v)
+        else:
+            s = str(v).strip().replace(",", "")
+            if s:
+                try:
+                    if re.fullmatch(r"-?\d+(?:\.\d+)?", s):
+                        num = float(s)
+                except Exception:
+                    pass
+    return num
+
+@app.post("/payroll/timesheet/upload")
+async def upload_timesheet(file: UploadFile = File(...)):
+    """
+    Each employee block starts with a 'name' row (may include trailing '(123)').
+    Within the next ~10 rows there will be a row containing 'Total Hours' with
+    a numeric value to the right. That numeric is used as Week 1 hours.
+
+    Returns:
+      matches: [{employee_id, timesheet_name, week1_hours}]
+      unmatched: [{name, hours, reason}]
+    """
+    # 1) Load sheet
+    try:
+        df = _read_any_excel(file)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {e}")
+
+    # 2) Load DB mapping timesheet_name -> employee_id
+    with open_db() as conn:
+        tname, cols = discover_employee_table(conn)
+        if "timesheet_name" not in cols:
+            raise HTTPException(status_code=400, detail="DB is missing 'timesheet_name' column.")
+        rs = conn.execute(f"SELECT employee_id, timesheet_name FROM '{tname}'").fetchall()
+        db_map = {norm_name(r["timesheet_name"]): r["employee_id"] for r in rs if r["timesheet_name"]}
+
+    values = df.fillna("").values.tolist()
+    nrows = len(values)
+
+    matches: List[Dict[str, Any]] = []
+    unmatched: List[Dict[str, Any]] = []
+
+    i = 0
+    while i < nrows:
+        row = values[i]
+        first_nonempty = next((str(c).strip() for c in row if str(c).strip() != ""), "")
+        # Looks like a person name?
+        if first_nonempty and re.fullmatch(r"[A-Za-z ,.'\-]+(?:\s*\(\d+\))?", first_nonempty):
+            name_raw = first_nonempty
+            name_key = norm_name(name_raw)
+
+            # look ahead up to 10 rows for 'Total Hours'
+            hours = None
+            for j in range(i + 1, min(i + 11, nrows)):
+                rowj = values[j]
+                has_total = any(isinstance(c, str) and "total hours" in c.lower() for c in rowj)
+                if has_total:
+                    hours = _rightmost_number(rowj)
+                    break
+
+            if name_key:
+                emp_id = db_map.get(name_key)
+                if emp_id and hours is not None:
+                    matches.append({
+                        "employee_id": emp_id,
+                        "timesheet_name": name_key,
+                        "week1_hours": float(hours),
+                    })
+                elif hours is not None:
+                    unmatched.append({
+                        "name": name_key,
+                        "hours": float(hours),
+                        "reason": "No DB match",
+                    })
+                else:
+                    unmatched.append({
+                        "name": name_key,
+                        "hours": None,
+                        "reason": "Total Hours not found",
+                    })
+        i += 1
+
+    return {
+        "matched_count": len(matches),
+        "unmatched_count": len(unmatched),
+        "matches": matches,
+        "unmatched": unmatched,
+    }
 
 
 # =============================================================================
