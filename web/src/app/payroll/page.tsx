@@ -16,11 +16,7 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
-import {
-  DataGrid,
-  GridColDef,
-  GridRenderCellParams,
-} from "@mui/x-data-grid";
+import { DataGrid, GridColDef, GridRenderCellParams } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
 import UploadFileIcon from "@mui/icons-material/UploadFile";
@@ -162,7 +158,6 @@ export default function PayrollPage() {
   };
 
   const nextEmployeeId = React.useCallback((): string => {
-    // find the max E#### in current list
     const nums = allRows
       .map((r) => r.employee_id)
       .map((id) => {
@@ -244,7 +239,6 @@ export default function PayrollPage() {
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
 
-      // matched: fill W1
       if (Array.isArray(data.matched)) {
         setHours((prev) => {
           const copy = { ...prev };
@@ -255,7 +249,6 @@ export default function PayrollPage() {
         });
       }
 
-      // unmatched CSV -> download
       if (data.unmatched_csv) {
         const blob = new Blob([data.unmatched_csv], { type: "text/csv;charset=utf-8" });
         const url = URL.createObjectURL(blob);
@@ -342,7 +335,7 @@ export default function PayrollPage() {
       headerName: "Rate",
       minWidth: 90,
       valueGetter: (p) => (asNum((p as any).row?.labor_rate) ?? 0),
-      valueFormatter: (p) => money(Number(p.value)),
+      valueFormatter: (p: any) => money(Number(p?.value ?? 0)),
     },
     {
       field: "w1",
@@ -391,7 +384,7 @@ export default function PayrollPage() {
       headerName: "Per Diem Rate",
       minWidth: 130,
       valueGetter: (p) => (asNum((p as any).row?.per_diem) ?? 0),
-      valueFormatter: (p) => money(Number(p.value)),
+      valueFormatter: (p: any) => money(Number(p?.value ?? 0)),
     },
     {
       field: "per_diem_days",
@@ -424,7 +417,7 @@ export default function PayrollPage() {
         const h = hours[id] || {};
         return wagesFor((p as any).row as Employee, h.w1, h.w2);
       },
-      valueFormatter: (p) => money(Number(p.value)),
+      valueFormatter: (p: any) => money(Number(p?.value ?? 0)),
     },
     {
       field: "per_diem_total",
@@ -437,7 +430,7 @@ export default function PayrollPage() {
         const h = hours[id] || {};
         return perDiemTotalFor((p as any).row as Employee, h.pd);
       },
-      valueFormatter: (p) => money(Number(p.value)),
+      valueFormatter: (p: any) => money(Number(p?.value ?? 0)),
     },
     {
       field: "grand_total",
@@ -450,7 +443,7 @@ export default function PayrollPage() {
         const h = hours[id] || {};
         return grandTotalFor((p as any).row as Employee, h.w1, h.w2, h.pd);
       },
-      valueFormatter: (p) => money(Number(p.value)),
+      valueFormatter: (p: any) => money(Number(p?.value ?? 0)),
     },
     {
       field: "actions",
