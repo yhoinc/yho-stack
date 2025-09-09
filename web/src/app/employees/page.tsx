@@ -1,5 +1,4 @@
 "use client";
-
 import * as React from "react";
 import {
   Box,
@@ -13,10 +12,9 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
-import { DataGrid, GridColDef } from "@mui/x-data-grid";
+import { DataGrid, GridColDef, GridToolbar } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import AddIcon from "@mui/icons-material/Add";
-import DownloadIcon from "@mui/icons-material/Download";
 
 type Employee = {
   employee_id: string;
@@ -33,9 +31,10 @@ type Employee = {
   debt?: string | null;
   payment_count?: string | null;
   apartment_id?: string | null;
+  timesheet_name?: string | null; // NEW
 };
 
-export default function EmployeesPage(): React.ReactElement {
+export default function EmployeesPage() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
   const [rows, setRows] = React.useState<Employee[]>([]);
@@ -44,7 +43,7 @@ export default function EmployeesPage(): React.ReactElement {
   // search
   const [query, setQuery] = React.useState("");
 
-  // dialog / form
+  // dialog
   const [open, setOpen] = React.useState(false);
   const [mode, setMode] = React.useState<"create" | "edit">("create");
   const [form, setForm] = React.useState<Partial<Employee>>({});
@@ -67,73 +66,57 @@ export default function EmployeesPage(): React.ReactElement {
     fetchRows();
   }, [fetchRows]);
 
-  // ---------- helpers ----------
-  const asNumber = (v: unknown): number | null => {
-    const n = Number(v);
-    return Number.isFinite(n) ? n : null;
+  const moneyFmt = (p: any) => {
+    const v = p?.value;
+    return v == null || v === "" || Number.isNaN(Number(v))
+      ? "-"
+      : `$${Number(v).toFixed(2)}`;
+  };
+  const numFmt = (p: any) => {
+    const v = p?.value;
+    return v == null || v === "" || Number.isNaN(Number(v))
+      ? "-"
+      : Number(v).toFixed(2);
   };
 
-  const money = (v: unknown): string => {
-    const n = asNumber(v);
-    return n == null ? "-" : `$${n.toFixed(2)}`;
-  };
-
-  // find the next employee ID
-  const nextEmployeeId = (): string => {
-    let maxNum = 0;
-    rows.forEach((r) => {
-      const m = /^E(\d{1,})$/.exec(r.employee_id || "");
-      if (m) {
-        const num = parseInt(m[1], 10);
-        if (num > maxNum) maxNum = num;
-      }
-    });
-    const next = maxNum + 1;
-    return `E${String(next).padStart(4, "0")}`;
-  };
-
-  // search across multiple fields
-  const filteredRows = React.useMemo(() => {
+  const filtered = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return rows;
-    return rows.filter((r) => {
-      const hay = [
-        r.employee_id,
+    return rows.filter((r) =>
+      [
         r.name,
+        r.employee_id,
         r.reference,
         r.company,
         r.location,
         r.position,
-        r.phone,
+        r.timesheet_name, // include timesheet alias in search
       ]
         .filter(Boolean)
-        .map((s) => String(s).toLowerCase());
-      return hay.some((s) => s.includes(q));
-    });
+        .some((s) => String(s).toLowerCase().includes(q))
+    );
   }, [rows, query]);
 
-  // ---------- grid ----------
   const columns: GridColDef[] = [
-    { field: "employee_id", headerName: "ID", minWidth: 140 },
+    { field: "employee_id", headerName: "ID", minWidth: 120 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
+    { field: "timesheet_name", headerName: "Timesheet Name", flex: 1, minWidth: 220 }, // NEW
     { field: "reference", headerName: "Ref", minWidth: 110 },
     { field: "company", headerName: "Company", minWidth: 140 },
     { field: "location", headerName: "Location", minWidth: 120 },
     { field: "position", headerName: "Position", minWidth: 140 },
     { field: "phone", headerName: "Phone", minWidth: 150 },
-    {
-      field: "per_diem",
-      headerName: "Per Diem",
-      minWidth: 120,
-      renderCell: (p) => <span>{money(p?.row?.per_diem)}</span>,
-    },
+    { field: "per_diem", headerName: "Per Diem", minWidth: 120, type: "number", valueFormatter: numFmt },
     {
       field: "labor_rate",
       headerName: "Labor Rate",
       minWidth: 130,
-      renderCell: (p) => {
-        const v = p?.row?.labor_rate ?? (p?.row as any)?.pay_rate ?? null;
-        return <span>{money(v)}</span>;
+      sortable: true,
+      renderCell: (params) => {
+        const v =
+          params.row?.labor_rate ?? (params.row as any)?.pay_rate ?? null;
+        if (v == null || v === "" || Number.isNaN(Number(v))) return "-";
+        return `$${Number(v).toFixed(2)}`;
       },
     },
     {
@@ -154,11 +137,10 @@ export default function EmployeesPage(): React.ReactElement {
     },
   ];
 
-  // ---------- dialog handlers ----------
   function openCreate() {
     setMode("create");
     setForm({
-      employee_id: nextEmployeeId(),
+      employee_id: "",
       name: "",
       reference: "",
       company: "",
@@ -167,6 +149,7 @@ export default function EmployeesPage(): React.ReactElement {
       phone: "",
       per_diem: "",
       labor_rate: "",
+      timesheet_name: "",
     });
     setError(null);
     setOpen(true);
@@ -183,8 +166,6 @@ export default function EmployeesPage(): React.ReactElement {
     setSaving(true);
     try {
       const payload: any = { ...form };
-
-      // coerce numerics
       payload.labor_rate =
         payload.labor_rate === "" || payload.labor_rate == null
           ? null
@@ -206,26 +187,21 @@ export default function EmployeesPage(): React.ReactElement {
           body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error(await res.text());
-
-        // optimistic insert
-        setRows((prev) => [{ ...payload }, ...prev]);
       } else {
         const id = payload.employee_id;
         const { employee_id, ...rest } = payload;
-        const res = await fetch(`${API}/employees/${encodeURIComponent(id)}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(rest),
-        });
-        if (!res.ok) throw new Error(await res.text());
-
-        // optimistic update
-        setRows((prev) =>
-          prev.map((r) => (r.employee_id === id ? { ...r, ...rest } : r)),
+        const res = await fetch(
+          `${API}/employees/${encodeURIComponent(id)}`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(rest),
+          }
         );
+        if (!res.ok) throw new Error(await res.text());
       }
-
       setOpen(false);
+      await fetchRows(); // refresh grid to reflect edited per_diem/timesheet_name
     } catch (e: any) {
       setError(e?.message || "Save failed");
     } finally {
@@ -233,100 +209,34 @@ export default function EmployeesPage(): React.ReactElement {
     }
   }
 
-  // ---------- CSV export (entire DB) ----------
-  const downloadCSV = () => {
-    const csvHeaders = [
-      "employee_id",
-      "name",
-      "reference",
-      "company",
-      "location",
-      "position",
-      "phone",
-      "per_diem",
-      "labor_rate",
-      "address",
-      "deduction",
-      "debt",
-      "payment_count",
-      "apartment_id",
-    ];
-
-    const escape = (v: unknown) => {
-      if (v == null) return "";
-      const s = String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-
-    const lines = [
-      csvHeaders.join(","),
-      ...rows.map((r) =>
-        csvHeaders
-          .map((k) =>
-            k === "per_diem" || k === "labor_rate"
-              ? escape(asNumber((r as any)[k]) ?? "")
-              : escape((r as any)[k]),
-          )
-          .join(","),
-      ),
-    ];
-
-    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "employees_database.csv";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  };
-
-  // ---------- UI ----------
   return (
     <Stack gap={2}>
-      {/* Header / Actions */}
       <Stack direction="row" alignItems="center" justifyContent="space-between">
         <Typography variant="h5" fontWeight={600}>
           Employees
         </Typography>
-        <Stack direction="row" gap={1}>
+        <Stack direction="row" gap={1} alignItems="center">
           <TextField
             size="small"
-            placeholder="Search name, company, location, position, phone, ref, or ID…"
+            placeholder="Search name, company, location, position…"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            sx={{ minWidth: 420 }}
+            sx={{ minWidth: 380 }}
           />
-          <Button
-            variant="outlined"
-            startIcon={<DownloadIcon />}
-            onClick={downloadCSV}
-          >
-            Download CSV
-          </Button>
           <Button variant="contained" startIcon={<AddIcon />} onClick={openCreate}>
             Add Employee
           </Button>
         </Stack>
       </Stack>
 
-      {/* Grid */}
-      <Box
-        sx={{
-          height: 640,
-          width: "100%",
-          bgcolor: "background.paper",
-          borderRadius: 2,
-          p: 1,
-        }}
-      >
+      <Box sx={{ height: 640, width: "100%", bgcolor: "background.paper", borderRadius: 2, p: 1 }}>
         <DataGrid
-          rows={filteredRows}
+          rows={filtered}
           columns={columns}
           getRowId={(r) => r.employee_id}
           loading={loading}
           disableRowSelectionOnClick
+          slots={{ toolbar: GridToolbar }}
           initialState={{
             pagination: { paginationModel: { pageSize: 25, page: 0 } },
             sorting: { sortModel: [{ field: "name", sort: "asc" }] },
@@ -335,61 +245,87 @@ export default function EmployeesPage(): React.ReactElement {
         />
       </Box>
 
-      {/* Dialog */}
       <Dialog open={open} onClose={() => setOpen(false)} maxWidth="sm" fullWidth>
-        <DialogTitle>
-          {mode === "create" ? "Add Employee" : "Edit Employee"}
-        </DialogTitle>
+        <DialogTitle>{mode === "create" ? "Add Employee" : "Edit Employee"}</DialogTitle>
         <DialogContent dividers>
           <Box
             sx={{
               display: "grid",
               gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" },
               gap: 2,
+              mt: 0,
             }}
           >
-            <TextField label="Employee ID *" value={form.employee_id ?? ""} disabled />
+            <TextField
+              label="Employee ID *"
+              value={form.employee_id ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, employee_id: e.target.value }))
+              }
+              disabled={mode === "edit"}
+            />
             <TextField
               label="Name *"
               value={form.name ?? ""}
               onChange={(e) => setForm((p) => ({ ...p, name: e.target.value }))}
             />
             <TextField
+              label="Timesheet Name" // NEW
+              value={form.timesheet_name ?? ""}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, timesheet_name: e.target.value }))
+              }
+            />
+            <TextField
               label="Reference"
               value={form.reference ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, reference: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, reference: e.target.value }))
+              }
             />
             <TextField
               label="Company"
               value={form.company ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, company: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, company: e.target.value }))
+              }
             />
             <TextField
               label="Location"
               value={form.location ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, location: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, location: e.target.value }))
+              }
             />
             <TextField
               label="Position"
               value={form.position ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, position: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, position: e.target.value }))
+              }
             />
             <TextField
               label="Phone"
               value={form.phone ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, phone: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, phone: e.target.value }))
+              }
             />
             <TextField
               label="Per Diem"
               type="number"
               value={form.per_diem ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, per_diem: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, per_diem: e.target.value }))
+              }
             />
             <TextField
               label="Labor Rate"
               type="number"
               value={form.labor_rate ?? ""}
-              onChange={(e) => setForm((p) => ({ ...p, labor_rate: e.target.value }))}
+              onChange={(e) =>
+                setForm((p) => ({ ...p, labor_rate: e.target.value }))
+              }
             />
           </Box>
           {error && (
