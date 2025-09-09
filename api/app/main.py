@@ -1,6 +1,9 @@
 import os
 import io
+import re
+import csv
 import sqlite3
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Query
@@ -11,6 +14,12 @@ from fastapi.responses import StreamingResponse
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
+
+# Optional XLS/XLSX support (CSV works without these)
+try:
+    import pandas as pd  # type: ignore
+except Exception:
+    pd = None
 
 
 # =============================================================================
@@ -138,6 +147,26 @@ def filter_payload_to_table(payload: Dict[str, Any], columns: List[str]) -> Dict
 
 
 # =============================================================================
+# Startup: ensure timesheet_name column exists (safe if already present)
+# =============================================================================
+def ensure_timesheet_name_column() -> None:
+    with open_db() as conn:
+        tname, _cols = discover_employee_table(conn)
+        existing = [c["name"] for c in conn.execute(f"PRAGMA table_info('{tname}')").fetchall()]
+        if "timesheet_name" not in existing:
+            conn.execute(f"ALTER TABLE '{tname}' ADD COLUMN timesheet_name TEXT")
+            # initialize to name for immediate matches
+            if "name" in existing:
+                conn.execute(f"UPDATE '{tname}' SET timesheet_name = COALESCE(timesheet_name, name) "
+                             f"WHERE timesheet_name IS NULL OR timesheet_name = ''")
+            conn.commit()
+
+@app.on_event("startup")
+def on_startup():
+    ensure_timesheet_name_column()
+
+
+# =============================================================================
 # Employees
 # =============================================================================
 @app.get("/employees")
@@ -212,6 +241,149 @@ def patch_employee(employee_id: str, payload: Dict[str, Any]):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# Timesheet upload/preview (auto-fill payroll)
+# =============================================================================
+
+# Normalize: lowercase, strip accents, collapse spaces, trim
+def _norm(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    s = s.strip().lower()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+# Strip trailing " (12345)" (and any extra space before it)
+_PAREN_NUMBER_RE = re.compile(r"\s*\(\s*\d+\s*\)\s*$")
+
+def _strip_paren_number_suffix(s: str) -> str:
+    return _PAREN_NUMBER_RE.sub("", s or "")
+
+def _coerce_num(v: Any) -> float:
+    if v is None or v == "":
+        return 0.0
+    try:
+        s = str(v).strip().replace(",", "")
+        return float(s)
+    except Exception:
+        return 0.0
+
+# Column alias detection (case-insensitive)
+def _find_key(d: Dict[str, Any], candidates: List[str]) -> Optional[str]:
+    low = {k.lower(): k for k in d.keys()}
+    for c in candidates:
+        if c in low:
+            return low[c]
+    return None
+
+@app.post("/payroll/timesheet/preview")
+async def timesheet_preview(file: UploadFile = File(...)):
+    """
+    Upload a customer timesheet (CSV or XLS/XLSX if pandas is available).
+    Extract rows -> (name, week1_hours, week2_hours [optional]).
+    We strip trailing ' (12345)' from names before matching.
+
+    Returns:
+      {
+        "ok": true,
+        "matched": [{ employee_id, name, timesheet_name, week1_hours, week2_hours }],
+        "unmatched": [{ raw_name, week1_hours, week2_hours, reason }]
+      }
+    """
+    content = await file.read()
+    filename = (file.filename or "").lower()
+    rows: List[Dict[str, Any]] = []
+
+    # Parse file
+    if filename.endswith(".csv"):
+        try:
+            text = content.decode("utf-8", errors="ignore")
+            reader = csv.DictReader(io.StringIO(text))
+            rows = list(reader)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
+    elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+        if pd is None:
+            raise HTTPException(status_code=400, detail="XLS/XLSX requires pandas; please upload CSV or install pandas.")
+        try:
+            df = pd.read_excel(io.BytesIO(content))
+            rows = df.to_dict(orient="records")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to parse Excel: {e}")
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type. Upload CSV or XLS/XLSX.")
+
+    # Normalize and map columns
+    parsed: List[Dict[str, Any]] = []
+    for r in rows:
+        # Column aliases (case-insensitive)
+        name_key = _find_key(r, ["name", "employee", "worker", "full_name", "employee_name"])
+        w1_key   = _find_key(r, ["week1", "w1", "week 1", "wk1", "hours", "total", "regular", "reg"])
+        w2_key   = _find_key(r, ["week2", "w2", "week 2", "wk2"])
+
+        raw_name = str(r.get(name_key, "")).strip() if name_key else ""
+        raw_name = _strip_paren_number_suffix(raw_name)  # remove " (12345)"
+        week1 = _coerce_num(r.get(w1_key)) if w1_key else 0.0
+        week2 = _coerce_num(r.get(w2_key)) if w2_key else 0.0
+
+        if raw_name:
+            parsed.append({"raw_name": raw_name, "week1_hours": week1, "week2_hours": week2})
+
+    # Load employees
+    with open_db() as conn:
+        tname, _cols = discover_employee_table(conn)
+        employees = [dict_from_row(r) for r in conn.execute(f"SELECT * FROM '{tname}'").fetchall()]
+
+    # Build lookups: prefer timesheet_name; fallback to name
+    lookup: Dict[str, Dict[str, Any]] = {}
+    for e in employees:
+        tsn = _norm(_strip_paren_number_suffix(str(e.get("timesheet_name") or "")))
+        if tsn:
+            lookup[tsn] = e
+        nm = _norm(_strip_paren_number_suffix(str(e.get("name") or "")))
+        if nm and nm not in lookup:
+            lookup[nm] = e
+
+    matched: List[Dict[str, Any]] = []
+    unmatched: List[Dict[str, Any]] = []
+
+    # If multiple rows for same person in the sheet, sum them
+    accum: Dict[str, Dict[str, Any]] = {}
+    for pr in parsed:
+        key = _norm(pr["raw_name"])
+        if key not in accum:
+            accum[key] = {"raw_name": pr["raw_name"], "week1_hours": 0.0, "week2_hours": 0.0}
+        accum[key]["week1_hours"] += float(pr["week1_hours"])
+        accum[key]["week2_hours"] += float(pr["week2_hours"])
+
+    for key, pr in accum.items():
+        emp = lookup.get(key)
+        if emp:
+            matched.append({
+                "employee_id": emp.get("employee_id"),
+                "name": emp.get("name"),
+                "timesheet_name": emp.get("timesheet_name"),
+                "week1_hours": round(pr["week1_hours"], 2),
+                "week2_hours": round(pr["week2_hours"], 2),
+            })
+        else:
+            unmatched.append({
+                "raw_name": pr["raw_name"],
+                "week1_hours": round(pr["week1_hours"], 2),
+                "week2_hours": round(pr["week2_hours"], 2),
+                "reason": "No matching employee by timesheet_name/name",
+            })
+
+    return {
+        "ok": True,
+        "matched": matched,
+        "unmatched": unmatched,
+        "note": "Names are normalized and '(12345)' suffixes are ignored for matching.",
+    }
 
 
 # =============================================================================
@@ -339,6 +511,3 @@ def debug_sample(limit: int = 3):
         for row in rows:
             row["labor_rate_display"] = compute_labor_rate_display(row)
         return {"table": tname, "rows": rows}
-
-
-
