@@ -20,7 +20,7 @@ DATA_DIR = os.getenv("DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "employees_with_company_v3.db")
+DB_PATH = os.path.join(BASE_DIR, "employees_with_company_v4.db")
 
 # S3-compatible object storage (optional)
 S3_ENDPOINT = (os.getenv("S3_ENDPOINT") or "").strip()
@@ -339,5 +339,6 @@ def debug_sample(limit: int = 3):
         for row in rows:
             row["labor_rate_display"] = compute_labor_rate_display(row)
         return {"table": tname, "rows": rows}
+
 
 
