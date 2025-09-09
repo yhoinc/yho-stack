@@ -47,8 +47,6 @@ export default function PayrollPage() {
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
 
-  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
-
   // fetch employees
   const fetchRows = React.useCallback(async () => {
     setLoading(true);
@@ -164,7 +162,7 @@ export default function PayrollPage() {
     XLSX.writeFile(wb, "payroll.csv");
   };
 
-  // upload timesheet -> fill week1 hours; download unmatched
+  // ---- Timesheet upload (single ref, declared once) ----
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
   const triggerUpload = () => fileInputRef.current?.click();
 
