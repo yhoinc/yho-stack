@@ -32,7 +32,7 @@ type Employee = {
   labor_rate?: number | string | null;
   per_diem?: number | string | null;        // rate per day
   timesheet_name?: string | null;
-  quickbooks_name?: string | null;          // NEW: show + export
+  quickbooks_name?: string | null;          // INCLUDED in CSV/export
 };
 
 type HoursMap = Record<string, { w1?: number; w2?: number; pd?: number }>;
@@ -103,9 +103,7 @@ export default function PayrollPage() {
   const rows: Employee[] = React.useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return scopedRows;
-    return scopedRows.filter((r) =>
-      (r.name || "").toLowerCase().includes(q)
-    );
+    return scopedRows.filter((r) => (r.name || "").toLowerCase().includes(q));
   }, [scopedRows, query]);
 
   // ------- helpers -------
@@ -115,9 +113,9 @@ export default function PayrollPage() {
     return Number.isFinite(n) ? n : null;
   };
   const money = (v: number | null | undefined): string =>
-    !v || Number.isNaN(v) ? "$0.00" : `$${v.toFixed(2)}`;
+    v == null || Number.isNaN(v) ? "$0.00" : `$${v.toFixed(2)}`;
 
-  // OT: everything over 40 in (w1+w2) is 1.5×
+  // OT: everything over 40 (w1+w2) is 1.5×
   const wagesFor = (emp: Employee, h1?: number, h2?: number): number => {
     const rate = asNum(emp.labor_rate) ?? 0;
     const totalHrs = (asNum(h1) ?? 0) + (asNum(h2) ?? 0);
@@ -132,9 +130,8 @@ export default function PayrollPage() {
     return rate * days;
   };
 
-  const grandTotalFor = (emp: Employee, h1?: number, h2?: number, pdDays?: number): number => {
-    return wagesFor(emp, h1, h2) + perDiemTotalFor(emp, pdDays);
-  };
+  const grandTotalFor = (emp: Employee, h1?: number, h2?: number, pdDays?: number): number =>
+    wagesFor(emp, h1, h2) + perDiemTotalFor(emp, pdDays);
 
   const handleHoursChange = (id: string, key: "w1" | "w2", value: string) => {
     const n = value === "" ? undefined : Number(value);
@@ -188,9 +185,8 @@ export default function PayrollPage() {
     }
   };
 
-  // ------- optional: persist run (best-effort, OK if 404) + export CSV -------
+  // ------- optional: persist run (best-effort) + export CSV -------
   const saveAndExportCSV = async () => {
-    // Build items using current visible rows (respect filters + search)
     const items = rows.map((r) => {
       const h = hours[r.employee_id] || {};
       const h1 = asNum(h.w1) ?? 0;
@@ -205,7 +201,7 @@ export default function PayrollPage() {
       return {
         employee_id: r.employee_id,
         name: r.name ?? "",
-        quickbooks_name: r.quickbooks_name ?? "",   // <— include in export
+        quickbooks_name: r.quickbooks_name ?? "",
         reference: r.reference ?? "",
         company: r.company ?? "",
         location: r.location ?? "",
@@ -221,7 +217,7 @@ export default function PayrollPage() {
       };
     });
 
-    // Best-effort POST (if backend supports it). Ignore failures.
+    // Best-effort POST to /payroll/runs if present; ignore errors
     try {
       await fetch(`${API}/payroll/runs`, {
         method: "POST",
@@ -235,9 +231,7 @@ export default function PayrollPage() {
           commission: { beneficiary: "danny", per_hour_rate: 0.5 },
         }),
       });
-    } catch {
-      // ignore
-    }
+    } catch {}
 
     // CSV export
     const headers = [
@@ -295,7 +289,6 @@ export default function PayrollPage() {
     if (s === null || s === undefined) return "";
     const str = String(s);
     return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
-    // minimal CSV-escaping
   };
   const num = (n: number | null | undefined): string =>
     n == null || Number.isNaN(n) ? "" : String(n);
@@ -304,7 +297,7 @@ export default function PayrollPage() {
   const columns: GridColDef<Employee>[] = [
     { field: "employee_id", headerName: "ID", minWidth: 110 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 180 },
-    { field: "quickbooks_name", headerName: "QuickBooks Name", minWidth: 180 }, // visible + editable in dialog
+    { field: "quickbooks_name", headerName: "QuickBooks Name", minWidth: 180 },
     { field: "reference", headerName: "Ref", minWidth: 100 },
     { field: "company", headerName: "Company", minWidth: 140 },
     { field: "location", headerName: "Location", minWidth: 120 },
@@ -384,12 +377,12 @@ export default function PayrollPage() {
       minWidth: 130,
       sortable: false,
       filterable: false,
-      valueGetter: (p) => {
-        const id = (p.row as Employee).employee_id;
+      renderCell: (p: GridRenderCellParams<Employee, unknown>) => {
+        const id = p.row.employee_id;
         const h = hours[id] || {};
-        return perDiemTotalFor(p.row as Employee, h.pd);
+        const v = perDiemTotalFor(p.row, h.pd);
+        return money(v);
       },
-      valueFormatter: (p) => money(Number(p.value || 0)),
     },
     {
       field: "check_total",
@@ -397,13 +390,12 @@ export default function PayrollPage() {
       minWidth: 140,
       sortable: false,
       filterable: false,
-      valueGetter: (p) => {
-        const row = p.row as Employee;
-        const id = row.employee_id;
+      renderCell: (p: GridRenderCellParams<Employee, unknown>) => {
+        const id = p.row.employee_id;
         const h = hours[id] || {};
-        return grandTotalFor(row, h.w1, h.w2, h.pd);
+        const v = grandTotalFor(p.row, h.w1, h.w2, h.pd);
+        return money(v);
       },
-      valueFormatter: (p) => money(Number(p.value || 0)),
     },
     {
       field: "actions",
