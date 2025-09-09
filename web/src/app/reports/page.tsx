@@ -74,36 +74,37 @@ export default function ReportsPage() {
     fetchAll();
   }, [fetchAll]);
 
-  const money = (n: any) => `$${Number(n || 0).toFixed(2)}`;
+  const money = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
 
-  const colsCompany: GridColDef<CompanyRow>[] = [
+  // --- Columns (loosen formatter param typing to avoid 'never') ---
+  const colsCompany: GridColDef[] = [
     { field: "company", headerName: "Company", flex: 1, minWidth: 180 },
-    { field: "hours", headerName: "Hours", minWidth: 110, valueFormatter: (p) => Number(p.value || 0).toFixed(2) },
-    { field: "wages", headerName: "Wages", minWidth: 120, valueFormatter: (p) => money(p.value) },
-    { field: "per_diem", headerName: "Per Diem", minWidth: 120, valueFormatter: (p) => money(p.value) },
-    { field: "grand_total", headerName: "Total Out", minWidth: 140, valueFormatter: (p) => money(p.value) },
+    { field: "hours", headerName: "Hours", minWidth: 110, valueFormatter: (p: any) => Number(p.value || 0).toFixed(2) },
+    { field: "wages", headerName: "Wages", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
+    { field: "per_diem", headerName: "Per Diem", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
+    { field: "grand_total", headerName: "Total Out", minWidth: 140, valueFormatter: (p: any) => money(p.value) },
   ];
 
-  const colsEmp: GridColDef<EmpRow>[] = [
+  const colsEmp: GridColDef[] = [
     { field: "employee_id", headerName: "ID", minWidth: 110 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 200 },
     { field: "company", headerName: "Company", minWidth: 140 },
     { field: "location", headerName: "Location", minWidth: 120 },
-    { field: "hours", headerName: "Hours", minWidth: 110, valueFormatter: (p) => Number(p.value || 0).toFixed(2) },
-    { field: "wages", headerName: "Wages", minWidth: 120, valueFormatter: (p) => money(p.value) },
-    { field: "per_diem", headerName: "Per Diem", minWidth: 120, valueFormatter: (p) => money(p.value) },
-    { field: "grand_total", headerName: "Total Out", minWidth: 140, valueFormatter: (p) => money(p.value) },
+    { field: "hours", headerName: "Hours", minWidth: 110, valueFormatter: (p: any) => Number(p.value || 0).toFixed(2) },
+    { field: "wages", headerName: "Wages", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
+    { field: "per_diem", headerName: "Per Diem", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
+    { field: "grand_total", headerName: "Total Out", minWidth: 140, valueFormatter: (p: any) => money(p.value) },
   ];
 
-  const colsRuns: GridColDef<RunRow>[] = [
+  const colsRuns: GridColDef[] = [
     { field: "run_key", headerName: "Run", flex: 1, minWidth: 180 },
     { field: "created_at", headerName: "Created", minWidth: 160 },
     { field: "scope", headerName: "Scope", minWidth: 100 },
     { field: "company", headerName: "Company", minWidth: 140 },
     { field: "location", headerName: "Location", minWidth: 120 },
-    { field: "source_hours", headerName: "Hours", minWidth: 110, valueFormatter: (p) => Number(p.value || 0).toFixed(2) },
-    { field: "per_hour_rate", headerName: "Comm $/hr", minWidth: 110, valueFormatter: (p) => money(p.value) },
-    { field: "total_commission", headerName: "Commission", minWidth: 140, valueFormatter: (p) => money(p.value) },
+    { field: "source_hours", headerName: "Hours", minWidth: 110, valueFormatter: (p: any) => Number(p.value || 0).toFixed(2) },
+    { field: "per_hour_rate", headerName: "Comm $/hr", minWidth: 110, valueFormatter: (p: any) => money(p.value) },
+    { field: "total_commission", headerName: "Commission", minWidth: 140, valueFormatter: (p: any) => money(p.value) },
   ];
 
   return (
@@ -143,7 +144,7 @@ export default function ReportsPage() {
         <Box sx={{ p: 2, border: "1px dashed #e5e7eb", borderRadius: 2 }}>
           <Typography variant="body1">
             <b>Commission (danny):</b> {money(commission.total_commission)} &nbsp;|&nbsp; Hours:{" "}
-            {Number(commission.hours || 0).toFixed(2)} &nbsp;|&nbsp; Rate: {money(commission.per_hour_rate)}
+            {Number((commission as any).hours || 0).toFixed(2)} &nbsp;|&nbsp; Rate: {money((commission as any).per_hour_rate)}
           </Typography>
         </Box>
       )}
