@@ -165,6 +165,7 @@ export default function PayrollPage() {
   };
 
   // upload timesheet -> fill week1 hours; download unmatched
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
   const triggerUpload = () => fileInputRef.current?.click();
 
   const onUploadFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -178,9 +179,10 @@ export default function PayrollPage() {
       const data = await res.json() as {
         matches: { employee_id: string; timesheet_name: string; week1_hours: number }[];
         unmatched: { name: string; hours: number | null; reason: string }[];
+        matched_count: number;
+        unmatched_count: number;
       };
 
-      // apply matches to hours (week 1)
       setHours((prev) => {
         const next = { ...prev };
         for (const m of data.matches) {
@@ -189,7 +191,6 @@ export default function PayrollPage() {
         return next;
       });
 
-      // download unmatched CSV if any
       if (data.unmatched?.length) {
         const rows = data.unmatched.map(u => ({
           name: u.name,
@@ -261,7 +262,7 @@ export default function PayrollPage() {
             size="small"
             type="number"
             value={value}
-            onChange={(e) => id && handleHoursChange(id, "w2", e.target.value))}
+            onChange={(e) => id && handleHoursChange(id, "w2", e.target.value)}
             sx={{ width: 100 }}
           />
         );
