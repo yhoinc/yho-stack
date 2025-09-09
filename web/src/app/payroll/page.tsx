@@ -32,7 +32,7 @@ export default function PayrollPage() {
   // filters
   const [scope, setScope] = React.useState<"all" | "by">("all");
   const [company, setCompany] = React.useState<string>("(any)");
-  const [location, setLocation] = React.useState<string]("(any)");
+  const [location, setLocation] = React.useState<string>("(any)");
 
   // search
   const [query, setQuery] = React.useState<string>("");
