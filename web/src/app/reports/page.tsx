@@ -1,201 +1,331 @@
 "use client";
 import * as React from "react";
 import {
-  Box, Button, Stack, TextField, Typography, Tabs, Tab
+  Box,
+  Button,
+  Stack,
+  TextField,
+  Typography,
+  Tabs,
+  Tab,
 } from "@mui/material";
 import { DataGrid, GridColDef } from "@mui/x-data-grid";
 
-type CompanyRow = {
-  company: string;
-  hours: number;
-  wages: number;
-  per_diem: number;
-  grand_total: number;
-};
-
-type EmpRow = {
+type HoursCompany = { company: string; run_date: string; total_hours: number };
+type HoursEmployee = {
   employee_id: string;
   name: string;
   company: string;
-  location: string;
-  hours: number;
-  wages: number;
-  per_diem: number;
-  grand_total: number;
+  run_date: string;
+  total_hours: number;
 };
-
-type RunRow = {
-  run_id: number;
-  run_key: string;
-  created_at: string;
-  scope?: string | null;
-  company?: string | null;
-  location?: string | null;
-  total_commission?: number | null;
-  source_hours?: number | null;
-  per_hour_rate?: number | null;
+type PayoutCompany = { company: string; run_date: string; total_payout: number };
+type PayoutEmployee = {
+  employee_id: string;
+  name: string;
+  company: string;
+  run_date: string;
+  total_paid: number;
+};
+type CommissionRow = {
+  beneficiary: string;
+  run_date: string;
+  per_hour_rate: number;
+  source_hours: number;
+  total_commission: number;
 };
 
 export default function ReportsPage() {
   const API = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
 
-  const [from, setFrom] = React.useState<string>("");
-  const [to, setTo] = React.useState<string>("");
+  const [dateFrom, setDateFrom] = React.useState("");
+  const [dateTo, setDateTo] = React.useState("");
   const [tab, setTab] = React.useState(0);
-
-  const [byCompany, setByCompany] = React.useState<CompanyRow[]>([]);
-  const [byEmployee, setByEmployee] = React.useState<EmpRow[]>([]);
-  const [runs, setRuns] = React.useState<RunRow[]>([]);
-  const [commission, setCommission] = React.useState<{ total_commission: number; hours: number; per_hour_rate: number } | null>(null);
   const [loading, setLoading] = React.useState(false);
 
-  const fetchAll = React.useCallback(async () => {
+  // Data sets
+  const [hoursByCompany, setHoursByCompany] = React.useState<HoursCompany[]>(
+    []
+  );
+  const [hoursByEmployee, setHoursByEmployee] = React.useState<HoursEmployee[]>(
+    []
+  );
+  const [payoutByCompany, setPayoutByCompany] = React.useState<PayoutCompany[]>(
+    []
+  );
+  const [payoutByEmployee, setPayoutByEmployee] = React.useState<
+    PayoutEmployee[]
+  >([]);
+  const [commissions, setCommissions] = React.useState<CommissionRow[]>([]);
+
+  const qs = () => {
+    const q = new URLSearchParams();
+    if (dateFrom) q.set("date_from", dateFrom);
+    if (dateTo) q.set("date_to", dateTo);
+    return q.toString();
+  };
+
+  const fetchJSON = async <T,>(url: string): Promise<T> => {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  };
+
+  const money = (v: unknown) => `$${Number(v || 0).toFixed(2)}`;
+  const hoursFmt = (v: unknown) => Number(v || 0).toFixed(2);
+
+  const loadAll = React.useCallback(async () => {
     setLoading(true);
     try {
-      const q = new URLSearchParams();
-      if (from) q.set("date_from", from);
-      if (to) q.set("date_to", to);
+      const query = qs();
 
-      const s = await fetch(`${API}/reports/summary?${q.toString()}`);
-      const sd = await s.json();
-      setByCompany(sd.by_company ?? []);
-      setByEmployee(sd.by_employee ?? []);
-      setCommission(sd.commission ?? null);
+      const [
+        hco,
+        hem,
+        pco,
+        pem,
+        com,
+      ] = await Promise.all([
+        fetchJSON<{ rows: HoursCompany[] }>(
+          `${API}/payroll/summary/hours_by_company?${query}`
+        ),
+        fetchJSON<{ rows: HoursEmployee[] }>(
+          `${API}/payroll/summary/hours_by_employee?${query}`
+        ),
+        fetchJSON<{ rows: PayoutCompany[] }>(
+          `${API}/payroll/summary/payout_by_company?${query}`
+        ),
+        fetchJSON<{ rows: PayoutEmployee[] }>(
+          `${API}/payroll/summary/payout_by_employee?${query}`
+        ),
+        fetchJSON<{ rows: CommissionRow[] }>(
+          `${API}/payroll/summary/commissions?${query}`
+        ),
+      ]);
 
-      const r = await fetch(`${API}/reports/runs`);
-      const rd = await r.json();
-      setRuns(rd.rows ?? []);
+      setHoursByCompany(hco.rows ?? []);
+      setHoursByEmployee(hem.rows ?? []);
+      setPayoutByCompany(pco.rows ?? []);
+      setPayoutByEmployee(pem.rows ?? []);
+      setCommissions(com.rows ?? []);
     } finally {
       setLoading(false);
     }
-  }, [API, from, to]);
+  }, [API, dateFrom, dateTo]);
 
   React.useEffect(() => {
-    fetchAll();
-  }, [fetchAll]);
+    // initial load
+    loadAll();
+  }, [loadAll]);
 
-  const money = (n: unknown) => `$${Number(n || 0).toFixed(2)}`;
+  // CSV helpers
+  function downloadCSV<T extends object>(rows: T[], filename: string) {
+    if (!rows?.length) {
+      alert("No data to download.");
+      return;
+    }
+    const headers = Object.keys(rows[0]);
+    const csv = [
+      headers.join(","),
+      ...rows.map((r) =>
+        headers
+          .map((h) => {
+            const raw = (r as any)[h];
+            const s = raw == null ? "" : String(raw);
+            // naive CSV escaping
+            if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+              return `"${s.replace(/"/g, '""')}"`;
+            }
+            return s;
+          })
+          .join(",")
+      ),
+    ].join("\n");
 
-  // --- Columns (loosen formatter param typing to avoid 'never') ---
-  const colsCompany: GridColDef[] = [
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // Columns (loosen formatter param typing to avoid TS 'never' issues)
+  const colsHoursByCompany: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 120 },
     { field: "company", headerName: "Company", flex: 1, minWidth: 180 },
-    { field: "hours", headerName: "Hours", minWidth: 110, valueFormatter: (p: any) => Number(p.value || 0).toFixed(2) },
-    { field: "wages", headerName: "Wages", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
-    { field: "per_diem", headerName: "Per Diem", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
-    { field: "grand_total", headerName: "Total Out", minWidth: 140, valueFormatter: (p: any) => money(p.value) },
+    {
+      field: "total_hours",
+      headerName: "Hours",
+      minWidth: 110,
+      valueFormatter: (p: any) => hoursFmt(p.value),
+    },
   ];
 
-  const colsEmp: GridColDef[] = [
+  const colsHoursByEmployee: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 120 },
     { field: "employee_id", headerName: "ID", minWidth: 110 },
     { field: "name", headerName: "Name", flex: 1, minWidth: 200 },
     { field: "company", headerName: "Company", minWidth: 140 },
-    { field: "location", headerName: "Location", minWidth: 120 },
-    { field: "hours", headerName: "Hours", minWidth: 110, valueFormatter: (p: any) => Number(p.value || 0).toFixed(2) },
-    { field: "wages", headerName: "Wages", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
-    { field: "per_diem", headerName: "Per Diem", minWidth: 120, valueFormatter: (p: any) => money(p.value) },
-    { field: "grand_total", headerName: "Total Out", minWidth: 140, valueFormatter: (p: any) => money(p.value) },
+    {
+      field: "total_hours",
+      headerName: "Hours",
+      minWidth: 110,
+      valueFormatter: (p: any) => hoursFmt(p.value),
+    },
   ];
 
-  const colsRuns: GridColDef[] = [
-    { field: "run_key", headerName: "Run", flex: 1, minWidth: 180 },
-    { field: "created_at", headerName: "Created", minWidth: 160 },
-    { field: "scope", headerName: "Scope", minWidth: 100 },
-    { field: "company", headerName: "Company", minWidth: 140 },
-    { field: "location", headerName: "Location", minWidth: 120 },
-    { field: "source_hours", headerName: "Hours", minWidth: 110, valueFormatter: (p: any) => Number(p.value || 0).toFixed(2) },
-    { field: "per_hour_rate", headerName: "Comm $/hr", minWidth: 110, valueFormatter: (p: any) => money(p.value) },
-    { field: "total_commission", headerName: "Commission", minWidth: 140, valueFormatter: (p: any) => money(p.value) },
+  const colsPayoutByCompany: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 120 },
+    { field: "company", headerName: "Company", flex: 1, minWidth: 180 },
+    {
+      field: "total_payout",
+      headerName: "Money Out",
+      minWidth: 140,
+      valueFormatter: (p: any) => money(p.value),
+    },
   ];
+
+  const colsPayoutByEmployee: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 120 },
+    { field: "employee_id", headerName: "ID", minWidth: 110 },
+    { field: "name", headerName: "Name", flex: 1, minWidth: 200 },
+    { field: "company", headerName: "Company", minWidth: 140 },
+    {
+      field: "total_paid",
+      headerName: "Money Out",
+      minWidth: 140,
+      valueFormatter: (p: any) => money(p.value),
+    },
+  ];
+
+  const colsCommission: GridColDef[] = [
+    { field: "run_date", headerName: "Run Date", minWidth: 120 },
+    { field: "beneficiary", headerName: "Beneficiary", minWidth: 140 },
+    {
+      field: "per_hour_rate",
+      headerName: "Rate ($/hr)",
+      minWidth: 120,
+      valueFormatter: (p: any) => money(p.value),
+    },
+    {
+      field: "source_hours",
+      headerName: "Hours",
+      minWidth: 110,
+      valueFormatter: (p: any) => hoursFmt(p.value),
+    },
+    {
+      field: "total_commission",
+      headerName: "Commission",
+      minWidth: 140,
+      valueFormatter: (p: any) => money(p.value),
+    },
+  ];
+
+  // Per-tab data & CSV hooks
+  const current = [
+    {
+      rows: hoursByCompany,
+      id: (r: HoursCompany) => `${r.run_date}-${r.company}`,
+      columns: colsHoursByCompany,
+      csv: () => downloadCSV(hoursByCompany, "hours_by_company.csv"),
+    },
+    {
+      rows: hoursByEmployee,
+      id: (r: HoursEmployee) => `${r.run_date}-${r.employee_id}-${r.company}`,
+      columns: colsHoursByEmployee,
+      csv: () => downloadCSV(hoursByEmployee, "hours_by_employee.csv"),
+    },
+    {
+      rows: payoutByCompany,
+      id: (r: PayoutCompany) => `${r.run_date}-${r.company}`,
+      columns: colsPayoutByCompany,
+      csv: () => downloadCSV(payoutByCompany, "money_out_by_company.csv"),
+    },
+    {
+      rows: payoutByEmployee,
+      id: (r: PayoutEmployee) => `${r.run_date}-${r.employee_id}-${r.company}`,
+      columns: colsPayoutByEmployee,
+      csv: () => downloadCSV(payoutByEmployee, "money_out_by_employee.csv"),
+    },
+    {
+      rows: commissions,
+      id: (r: CommissionRow, idx: number) => `${r.run_date}-${r.beneficiary}-${idx}`,
+      columns: colsCommission,
+      csv: () => downloadCSV(commissions, "commission.csv"),
+    },
+  ][tab];
 
   return (
     <Stack gap={2}>
       <Stack direction="row" alignItems="center" justifyContent="space-between">
-        <Typography variant="h5" fontWeight={700}>Reports</Typography>
+        <Typography variant="h5" fontWeight={700}>
+          Reports
+        </Typography>
       </Stack>
 
+      {/* Date Filters */}
       <Box
         sx={{
-          p: 2, background: "#fff", border: "1px solid #e5e7eb", borderRadius: 2,
-          display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr auto" }, gap: 2
+          p: 2,
+          background: "#fff",
+          border: "1px solid #e5e7eb",
+          borderRadius: 2,
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr auto auto" },
+          gap: 2,
         }}
       >
         <TextField
           label="From"
           type="date"
-          value={from}
-          onChange={(e) => setFrom(e.target.value)}
+          value={dateFrom}
+          onChange={(e) => setDateFrom(e.target.value)}
           size="small"
           InputLabelProps={{ shrink: true }}
         />
         <TextField
           label="To"
           type="date"
-          value={to}
-          onChange={(e) => setTo(e.target.value)}
+          value={dateTo}
+          onChange={(e) => setDateTo(e.target.value)}
           size="small"
           InputLabelProps={{ shrink: true }}
         />
-        <Button variant="contained" onClick={fetchAll} disabled={loading}>
+        <Button variant="contained" onClick={loadAll} disabled={loading}>
           Apply
+        </Button>
+        <Button variant="outlined" onClick={current.csv} disabled={!current.rows.length}>
+          Download CSV
         </Button>
       </Box>
 
-      {commission && (
-        <Box sx={{ p: 2, border: "1px dashed #e5e7eb", borderRadius: 2 }}>
-          <Typography variant="body1">
-            <b>Commission (danny):</b> {money(commission.total_commission)} &nbsp;|&nbsp; Hours:{" "}
-            {Number((commission as any).hours || 0).toFixed(2)} &nbsp;|&nbsp; Rate: {money((commission as any).per_hour_rate)}
-          </Typography>
-        </Box>
-      )}
-
+      {/* Tabs */}
       <Tabs value={tab} onChange={(_, v) => setTab(v)}>
-        <Tab label="By Company" />
-        <Tab label="By Employee" />
-        <Tab label="Runs" />
+        <Tab label="Hours by Company" />
+        <Tab label="Hours by Employee" />
+        <Tab label="Money Out by Company" />
+        <Tab label="Money Out by Employee" />
+        <Tab label="Commission" />
       </Tabs>
 
-      {tab === 0 && (
-        <Box sx={{ height: 520, bgcolor: "background.paper", borderRadius: 2 }}>
-          <DataGrid
-            rows={byCompany}
-            columns={colsCompany}
-            getRowId={(r) => r.company}
-            loading={loading}
-            pageSizeOptions={[10, 25, 50, 100]}
-            initialState={{ pagination: { paginationModel: { pageSize: 25, page: 0 } } }}
-            sx={{ "& .MuiDataGrid-columnHeaders": { background: "#f3f4f6", fontWeight: 600 } }}
-          />
-        </Box>
-      )}
-
-      {tab === 1 && (
-        <Box sx={{ height: 520, bgcolor: "background.paper", borderRadius: 2 }}>
-          <DataGrid
-            rows={byEmployee}
-            columns={colsEmp}
-            getRowId={(r) => `${r.employee_id}-${r.company}`}
-            loading={loading}
-            pageSizeOptions={[10, 25, 50, 100]}
-            initialState={{ pagination: { paginationModel: { pageSize: 25, page: 0 } } }}
-            sx={{ "& .MuiDataGrid-columnHeaders": { background: "#f3f4f6", fontWeight: 600 } }}
-          />
-        </Box>
-      )}
-
-      {tab === 2 && (
-        <Box sx={{ height: 520, bgcolor: "background.paper", borderRadius: 2 }}>
-          <DataGrid
-            rows={runs}
-            columns={colsRuns}
-            getRowId={(r) => r.run_id}
-            loading={loading}
-            pageSizeOptions={[10, 25, 50, 100]}
-            initialState={{ pagination: { paginationModel: { pageSize: 25, page: 0 } } }}
-            sx={{ "& .MuiDataGrid-columnHeaders": { background: "#f3f4f6", fontWeight: 600 } }}
-          />
-        </Box>
-      )}
+      {/* Grid */}
+      <Box sx={{ height: 560, bgcolor: "background.paper", borderRadius: 2 }}>
+        <DataGrid
+          rows={current.rows}
+          columns={current.columns}
+          getRowId={(r: any, idx?: number) => current.id(r, idx ?? 0)}
+          loading={loading}
+          pageSizeOptions={[10, 25, 50, 100]}
+          initialState={{
+            pagination: { paginationModel: { pageSize: 25, page: 0 } },
+          }}
+          sx={{
+            "& .MuiDataGrid-columnHeaders": { background: "#f3f4f6", fontWeight: 600 },
+          }}
+        />
+      </Box>
     </Stack>
   );
 }
