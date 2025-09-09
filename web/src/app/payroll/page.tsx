@@ -20,7 +20,6 @@ import {
   DataGrid,
   GridColDef,
   GridRenderCellParams,
-  GridValueGetterParams,
 } from "@mui/x-data-grid";
 import EditIcon from "@mui/icons-material/Edit";
 import SaveAltIcon from "@mui/icons-material/SaveAlt";
@@ -126,7 +125,7 @@ export default function PayrollPage() {
     if (v === null || v === undefined || v === "") return null;
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
-    };
+  };
   const money = (v: number | null | undefined): string =>
     v == null || Number.isNaN(v) ? "$0.00" : `$${v.toFixed(2)}`;
 
@@ -311,7 +310,6 @@ export default function PayrollPage() {
         headers
           .map((h) => {
             const v = (row as Record<string, unknown>)[h];
-            // basic CSV escaping
             const s = v == null ? "" : String(v);
             return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
           })
@@ -343,8 +341,7 @@ export default function PayrollPage() {
       field: "labor_rate",
       headerName: "Rate",
       minWidth: 90,
-      valueGetter: (p: GridValueGetterParams<Employee, unknown>) =>
-        asNum(p.row?.labor_rate) ?? 0,
+      valueGetter: (p) => (asNum((p as any).row?.labor_rate) ?? 0),
       valueFormatter: (p) => money(Number(p.value)),
     },
     {
@@ -393,8 +390,7 @@ export default function PayrollPage() {
       field: "per_diem",
       headerName: "Per Diem Rate",
       minWidth: 130,
-      valueGetter: (p: GridValueGetterParams<Employee, unknown>) =>
-        asNum(p.row?.per_diem) ?? 0,
+      valueGetter: (p) => (asNum((p as any).row?.per_diem) ?? 0),
       valueFormatter: (p) => money(Number(p.value)),
     },
     {
@@ -423,10 +419,10 @@ export default function PayrollPage() {
       minWidth: 120,
       filterable: false,
       sortable: false,
-      valueGetter: (p: GridValueGetterParams<Employee, unknown>) => {
-        const id = p.row.employee_id;
+      valueGetter: (p) => {
+        const id = (p as any).row.employee_id as string;
         const h = hours[id] || {};
-        return wagesFor(p.row, h.w1, h.w2);
+        return wagesFor((p as any).row as Employee, h.w1, h.w2);
       },
       valueFormatter: (p) => money(Number(p.value)),
     },
@@ -436,10 +432,10 @@ export default function PayrollPage() {
       minWidth: 120,
       filterable: false,
       sortable: false,
-      valueGetter: (p: GridValueGetterParams<Employee, unknown>) => {
-        const id = p.row.employee_id;
+      valueGetter: (p) => {
+        const id = (p as any).row.employee_id as string;
         const h = hours[id] || {};
-        return perDiemTotalFor(p.row, h.pd);
+        return perDiemTotalFor((p as any).row as Employee, h.pd);
       },
       valueFormatter: (p) => money(Number(p.value)),
     },
@@ -449,10 +445,10 @@ export default function PayrollPage() {
       minWidth: 140,
       filterable: false,
       sortable: false,
-      valueGetter: (p: GridValueGetterParams<Employee, unknown>) => {
-        const id = p.row.employee_id;
+      valueGetter: (p) => {
+        const id = (p as any).row.employee_id as string;
         const h = hours[id] || {};
-        return grandTotalFor(p.row, h.w1, h.w2, h.pd);
+        return grandTotalFor((p as any).row as Employee, h.w1, h.w2, h.pd);
       },
       valueFormatter: (p) => money(Number(p.value)),
     },
