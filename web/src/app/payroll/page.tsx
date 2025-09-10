@@ -103,11 +103,24 @@ export default function PayrollPage() {
   const asNum = (v: any): number | null =>
     v == null || v === "" || Number.isNaN(Number(v)) ? null : Number(v);
 
+  // --- OVERTIME LOGIC (per week, then summed) ---
+  // returns {straight, ot} for a single week's hours
+  const splitWeek = (weekHours: number) => {
+    const straight = Math.min(40, Math.max(0, weekHours));
+    const ot = Math.max(0, weekHours - 40);
+    return { straight, ot };
+  };
+
+  // wages for both weeks with separate OT per week
   const wagesFor = (emp: Employee, h1?: number, h2?: number): number => {
-    const lr = asNum(emp.labor_rate);
-    const a = asNum(h1) || 0;
-    const b = asNum(h2) || 0;
-    return lr == null ? 0 : lr * (a + b);
+    const rate = asNum(emp.labor_rate) ?? 0;
+    const w1 = asNum(h1) ?? 0;
+    const w2 = asNum(h2) ?? 0;
+    const s1 = splitWeek(w1);
+    const s2 = splitWeek(w2);
+    const straight = s1.straight + s2.straight;
+    const ot = s1.ot + s2.ot;
+    return straight * rate + ot * rate * 1.5;
   };
 
   const perDiemTotalFor = (emp: Employee, days?: number): number => {
@@ -203,8 +216,19 @@ export default function PayrollPage() {
         const d  = asNum(h.days) || 0;
         const rate = asNum(r.labor_rate) ?? 0;
         const pdRate = asNum(r.per_diem) ?? 0;
-        const wages = rate * (h1 + h2);
+
+        // straight/OT per week
+        const w1s = splitWeek(h1);
+        const w2s = splitWeek(h2);
+        const straightHours = w1s.straight + w2s.straight;
+        const overtimeHours = w1s.ot + w2s.ot;
+
+        const straightPay = straightHours * rate;
+        const overtimePay = overtimeHours * rate * 1.5;
+        const wages = straightPay + overtimePay;
+
         const pdTotal = pdRate * d;
+
         return {
           RunKey: run.run_key,
           EmployeeID: r.employee_id,
@@ -217,6 +241,10 @@ export default function PayrollPage() {
           LaborRate: rate,
           Week1Hours: h1,
           Week2Hours: h2,
+          StraightHours: straightHours,
+          OvertimeHours: overtimeHours,
+          StraightPay: straightPay,
+          OvertimePay: overtimePay,
           PerDiemRate: pdRate,
           PerDiemDays: d,
           PerDiemTotal: pdTotal,
@@ -360,7 +388,7 @@ export default function PayrollPage() {
       },
     },
 
-    // Wages total (hours * rate) — this is the "Check Total" (wages only)
+    // Wages total using per-week OT
     {
       field: "check_total",
       headerName: "Check Total",
@@ -409,7 +437,7 @@ export default function PayrollPage() {
       },
     },
 
-    // Per Diem total (rate * days) — separate from wages/check
+    // Per Diem total (rate * days)
     {
       field: "per_diem_total",
       headerName: "Per Diem Total",
