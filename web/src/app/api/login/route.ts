@@ -6,7 +6,8 @@ export async function POST(req: NextRequest) {
   try {
     const { username, password } = await req.json();
 
-    const user = loginUser(username, password);
+    // IMPORTANT: await the async function
+    const user = await loginUser(username, password);
     if (!user) {
       return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
     }
@@ -15,6 +16,9 @@ export async function POST(req: NextRequest) {
     setSessionCookie(res, { username: user.username, role: user.role });
     return res;
   } catch (err: any) {
-    return NextResponse.json({ error: err?.message ?? "Login failed" }, { status: 400 });
+    return NextResponse.json(
+      { error: err?.message ?? "Login failed" },
+      { status: 400 }
+    );
   }
 }
