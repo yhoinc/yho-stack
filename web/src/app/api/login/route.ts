@@ -6,16 +6,17 @@ export async function POST(req: NextRequest) {
   try {
     const { username, password } = await req.json();
 
-    const user = await loginUser(username, password); // returns { token, role, username, maxAge } | null
+    // loginUser returns: { token, role, username, maxAge } | null
+    const user = await loginUser(username, password);
     if (!user) {
       return NextResponse.json({ error: "Invalid credentials" }, { status: 401 });
     }
 
-    // respond
+    // Send minimal payload back
     const res = NextResponse.json({ ok: true, role: user.role as UserRole });
 
-    // NOTE: setSessionCookie(res, session, maxAgeSeconds)
-    setSessionCookie(res, { username: user.username, role: user.role as UserRole }, user.maxAge);
+    // IMPORTANT: setSessionCookie(res, token: string, maxAgeSeconds: number)
+    setSessionCookie(res, user.token, user.maxAge);
 
     return res;
   } catch (err: any) {
