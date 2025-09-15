@@ -1,48 +1,53 @@
 // web/middleware.ts
 import { NextResponse, type NextRequest } from "next/server";
 
-// IMPORTANT: keep this name in sync with /src/lib/auth.ts
+// Keep this in sync with src/lib/auth.ts
 const SESSION_COOKIE = "yho_session";
 
-// Public paths that do NOT require auth
-const PUBLIC = [/^\/login$/, /^\/api\/login$/, /^\/api\/logout$/];
+// Paths that do NOT require auth
+const PUBLIC: RegExp[] = [/^\/login$/, /^\/api\/login$/, /^\/api\/logout$/];
 
 export async function middleware(req: NextRequest) {
-  const { pathname, search } = req.nextUrl;
+  const { pathname } = req.nextUrl;
 
-  // Skip Next internals & static assets
+  // Skip Next internals & static files
   if (
     pathname.startsWith("/_next/") ||
     pathname.startsWith("/favicon") ||
-    pathname.startsWith("/robots") ||
-    pathname.startsWith("/sitemap")
+    pathname.startsWith("/assets/") ||
+    pathname.match(/\.(png|jpg|jpeg|gif|svg|ico|css|js|map|txt|woff2?)$/)
   ) {
     return NextResponse.next();
   }
 
   // Allow public routes
-  if (PUBLIC.some((re) => re.test(pathname))) {
+  if (PUBLIC.some(rx => rx.test(pathname))) {
     return NextResponse.next();
   }
 
-  // Require a session cookie for everything else
-  const hasSession = !!req.cookies.get(SESSION_COOKIE)?.value;
-  if (!hasSession) {
+  // Read session cookie
+  const session = req.cookies.get(SESSION_COOKIE)?.value ?? null;
+  if (!session) {
     const url = req.nextUrl.clone();
     url.pathname = "/login";
-    url.search = search
-      ? `?next=${encodeURIComponent(pathname + search)}`
-      : `?next=${encodeURIComponent(pathname)}`;
+    url.search = pathname && pathname !== "/" ? `?next=${encodeURIComponent(pathname)}` : "";
     return NextResponse.redirect(url);
   }
 
-  // (Optional) mark that middleware ran, for debugging in DevTools
+  // Optionally restrict by role example:
+  // const [, role] = session.split(":");
+  // if (pathname.startsWith("/admin") && role !== "admin") {
+  //   const url = req.nextUrl.clone();
+  //   url.pathname = "/";
+  //   return NextResponse.redirect(url);
+  // }
+
   const res = NextResponse.next();
-  res.headers.set("x-mw-hit", "1");
+  res.headers.set("x-auth-mw", "1");
   return res;
 }
 
-// Catch all paths; we filter inside the function
+// Match all paths and filter inside
 export const config = {
   matcher: ["/:path*"],
 };
