@@ -1,25 +1,16 @@
 // web/middleware.ts
 import { NextResponse, type NextRequest } from "next/server";
-// Use a RELATIVE import from project root (works on Render)
-import { verifySession, SESSION_COOKIE, type UserRole } from "./src/lib/auth";
 
-const PUBLIC_PATHS = new Set<string>([
-  "/login",
-  "/forbidden",
-  "/api/login",
-  "/api/logout",
-]);
+// IMPORTANT: keep this name in sync with /src/lib/auth.ts
+const SESSION_COOKIE = "yho_session";
 
-// Section access per role
-const ACCESS: Record<UserRole, Array<string>> = {
-  admin: ["", "employees", "payroll", "reports", "documents"], // "" = homepage
-  staff: ["", "employees", "documents"],
-};
+// Public paths that do NOT require auth
+const PUBLIC = [/^\/login$/, /^\/api\/login$/, /^\/api\/logout$/];
 
 export async function middleware(req: NextRequest) {
   const { pathname, search } = req.nextUrl;
 
-  // Skip Next internals & obvious public assets
+  // Skip Next internals & static assets
   if (
     pathname.startsWith("/_next/") ||
     pathname.startsWith("/favicon") ||
@@ -29,17 +20,13 @@ export async function middleware(req: NextRequest) {
     return NextResponse.next();
   }
 
-  // Public routes never require auth
-  if (PUBLIC_PATHS.has(pathname)) {
+  // Allow public routes
+  if (PUBLIC.some((re) => re.test(pathname))) {
     return NextResponse.next();
   }
 
-  // Get the cookie value and validate it
-  const cookieVal = req.cookies.get(SESSION_COOKIE)?.value ?? "";
-  const session = await verifySession(cookieVal); // <— pass string, not the request
-  const hasSession = !!session;
-
-  // Not logged in → redirect to /login and preserve intended dest
+  // Require a session cookie for everything else
+  const hasSession = !!req.cookies.get(SESSION_COOKIE)?.value;
   if (!hasSession) {
     const url = req.nextUrl.clone();
     url.pathname = "/login";
@@ -49,20 +36,13 @@ export async function middleware(req: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  // Role-based gating
-  const role = session.role as UserRole;
-  const top = pathname.split("/")[1] ?? ""; // "", "employees", "payroll", ...
-  const allowed = ACCESS[role] ?? [];
-  if (!allowed.includes(top)) {
-    const url = req.nextUrl.clone();
-    url.pathname = "/forbidden";
-    return NextResponse.redirect(url);
-  }
-
-  return NextResponse.next();
+  // (Optional) mark that middleware ran, for debugging in DevTools
+  const res = NextResponse.next();
+  res.headers.set("x-mw-hit", "1");
+  return res;
 }
 
-// Apply to everything except Next internals / favicon
+// Catch all paths; we filter inside the function
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/:path*"],
 };
