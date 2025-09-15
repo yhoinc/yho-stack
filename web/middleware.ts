@@ -1,8 +1,8 @@
 // web/middleware.ts
 import { NextRequest, NextResponse } from "next/server";
-import { verifySession, SESSION_COOKIE } from "@/lib/auth";
+//import { verifySession, SESSION_COOKIE } from "@/lib/auth";
 import { canAccess, defaultRouteFor, type UserRole } from "@/lib/rbac";
-
+import { verifySession, SESSION_COOKIE } from "./src/lib/auth";
 // Public routes that never require auth
 const PUBLIC_ALLOW = new Set<string>([
   "/login",
