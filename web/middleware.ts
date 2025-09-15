@@ -1,62 +1,66 @@
 // web/middleware.ts
-import { NextRequest, NextResponse } from "next/server";
-//import { verifySession, SESSION_COOKIE } from "@/lib/auth";
-import { canAccess, defaultRouteFor, type UserRole } from "@/lib/rbac";
-import { verifySession, SESSION_COOKIE } from "./src/lib/auth";
-// Public routes that never require auth
-const PUBLIC_ALLOW = new Set<string>([
+import { NextResponse, type NextRequest } from "next/server";
+// IMPORTANT: this path must be relative from project root
+import { verifySession, type UserRole } from "./src/lib/auth";
+
+const PUBLIC_PATHS = new Set<string>([
   "/login",
+  "/forbidden",
   "/api/login",
   "/api/logout",
-  "/forbidden",
 ]);
 
-export async function middleware(req: NextRequest) {
-  const { pathname } = req.nextUrl;
+// Which roles can access which top-level sections
+const ACCESS: Record<UserRole, Array<string>> = {
+  admin: ["employees", "payroll", "reports", "documents", ""], // "" = homepage
+  staff: ["employees", "documents", ""],
+};
 
-  // Allow Next.js internals & static assets
+export async function middleware(req: NextRequest) {
+  const { pathname, search } = req.nextUrl;
+
+  // Skip Next internals and public assets
   if (
-    pathname.startsWith("/_next") ||
+    pathname.startsWith("/_next/") ||
     pathname.startsWith("/favicon") ||
-    pathname.startsWith("/public")
+    pathname.startsWith("/robots") ||
+    pathname.startsWith("/sitemap")
   ) {
     return NextResponse.next();
   }
 
-  // Public routes pass through
-  if (PUBLIC_ALLOW.has(pathname)) {
+  // Public routes that never require auth
+  if (PUBLIC_PATHS.has(pathname)) {
     return NextResponse.next();
   }
 
-  // Verify session
-  const token = req.cookies.get(SESSION_COOKIE)?.value;
-  const session = await verifySession(token); // -> { username, role } | null
+  // Verify session (cookie is read inside verifySession)
+  const session = await verifySession(req);
+  const hasSession = !!session;
 
-  // Not logged in -> redirect to login (don’t render anything)
-  if (!session) {
-    const url = new URL("/login", req.url);
-    url.searchParams.set("next", pathname);
+  // If no session, send to /login and remember where they were going
+  if (!hasSession) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/login";
+    url.search = search ? `?next=${encodeURIComponent(pathname + search)}` : `?next=${encodeURIComponent(pathname)}`;
     return NextResponse.redirect(url);
   }
 
-  // Logged in but check RBAC
+  // Role-based gate
   const role = session.role as UserRole;
-  if (!canAccess(pathname, role)) {
-    // Option A: Send to a "forbidden" page
-    const url = new URL("/forbidden", req.url);
-    url.searchParams.set("to", pathname);
-    return NextResponse.redirect(url);
+  const top = pathname.split("/")[1] ?? ""; // "", "employees", "payroll", ...
+  const allowed = ACCESS[role] ?? [];
 
-    // Option B (alternative): push to their default landing
-    // const url = new URL(defaultRouteFor(role), req.url);
-    // return NextResponse.redirect(url);
+  if (!allowed.includes(top)) {
+    const url = req.nextUrl.clone();
+    url.pathname = "/forbidden";
+    return NextResponse.redirect(url);
   }
 
-  // Everything ok
   return NextResponse.next();
 }
 
-// Apply to all routes (except static) so nothing leaks
+// Run on all paths except Next internals (handled above)
 export const config = {
   matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
 };
