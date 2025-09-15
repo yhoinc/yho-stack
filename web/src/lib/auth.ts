@@ -1,100 +1,120 @@
 // web/src/lib/auth.ts
-/* Minimal cookie-based auth for YHO.
-   Users are fixed (per requirements) and sessions are HMAC-signed with AUTH_SECRET.
-   Works in Middleware (Edge) and Route Handlers (Node) via Web Crypto.
-*/
+import { createHmac, timingSafeEqual } from "crypto";
+
 export type UserRole = "admin" | "staff";
+
+/** Cookie + secret */
 export const SESSION_COOKIE = "yho_session";
+const AUTH_SECRET = process.env.AUTH_SECRET || "dev-secret-change-me";
 
-type UserRecord = { username: string; password: string; role: UserRole };
+/** In-memory user list (simple demo auth). */
+type UserRow = {
+  username: string;
+  password: string; // plain for demo only
+  role: UserRole;
+  // Which sections they can access (middleware also checks role)
+  scopes: Array<"employees" | "documents" | "payroll" | "reports" | "all">;
+};
 
-const USERS: UserRecord[] = [
-  { username: "admin",  password: "admin", role: "admin" },
-  { username: "danny",  password: "Yho",   role: "staff" },
-  { username: "heejung", password: "Yho",  role: "staff" },
+const USERS: UserRow[] = [
+  { username: "admin",  password: "admin", role: "admin", scopes: ["all"] },
+  { username: "danny",  password: "Yho",   role: "staff", scopes: ["employees", "documents"] },
+  { username: "heejung",password: "Yho",   role: "staff", scopes: ["employees", "documents"] },
 ];
 
-const b64url = (buf: ArrayBuffer | Uint8Array) =>
-  Buffer.from(buf instanceof Uint8Array ? buf : new Uint8Array(buf))
-    .toString("base64")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/g, "");
-
-const fromB64url = (s: string) =>
-  Uint8Array.from(Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64"));
-
-async function getKey() {
-  const secret = process.env.AUTH_SECRET || "dev-secret-change-me";
-  const enc = new TextEncoder().encode(secret);
-  return await crypto.subtle.importKey(
-    "raw",
-    enc,
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign", "verify"]
-  );
+/** Find a user by creds (constant-time compare on password where possible). */
+function findUser(username: string, password: string): UserRow | null {
+  const u = USERS.find(x => x.username === username);
+  if (!u) return null;
+  // Simple compare (demo). For production, hash & salt.
+  return u.password === password ? u : null;
 }
 
-/** Create a signed session token containing username, role, and exp (epoch seconds). */
-export async function createSession(username: string, role: UserRole, ttlDays = 7) {
-  const header = { alg: "HS256", typ: "JWT" };
-  const now = Math.floor(Date.now() / 1000);
-  const payload = { sub: username, role, iat: now, exp: now + ttlDays * 86400 };
-
-  const h = b64url(new TextEncoder().encode(JSON.stringify(header)));
-  const p = b64url(new TextEncoder().encode(JSON.stringify(payload)));
-  const data = new TextEncoder().encode(`${h}.${p}`);
-
-  const key = await getKey();
-  const sig = await crypto.subtle.sign("HMAC", key, data);
-  const s = b64url(sig);
-
-  return `${h}.${p}.${s}`;
+/** Tiny HMAC-signed token (not JWT) */
+function sign(data: string): string {
+  const sig = createHmac("sha256", AUTH_SECRET).update(data).digest("base64url");
+  return sig;
 }
-
-/** Verify a session token. Returns { username, role } if valid, else null. */
-export async function verifySession(token?: string | null): Promise<{ username: string; role: UserRole } | null> {
-  if (!token) return null;
-  const parts = token.split(".");
-  if (parts.length !== 3) return null;
-
-  const [h, p, s] = parts;
-  const key = await getKey();
-
-  const data = new TextEncoder().encode(`${h}.${p}`);
-  const sigOk = await crypto.subtle.verify("HMAC", key, fromB64url(s), data);
-  if (!sigOk) return null;
-
+function verify(data: string, sig: string): boolean {
   try {
-    const payloadJson = new TextDecoder().decode(fromB64url(p));
-    const payload = JSON.parse(payloadJson) as { sub: string; role: UserRole; exp: number };
-    if (!payload?.sub || !payload?.role || !payload?.exp) return null;
-    if (Math.floor(Date.now() / 1000) >= payload.exp) return null;
-    return { username: payload.sub, role: payload.role };
+    const expect = createHmac("sha256", AUTH_SECRET).update(data).digest();
+    const got = Buffer.from(sig, "base64url");
+    return expect.length === got.length && timingSafeEqual(expect, got);
+  } catch {
+    return false;
+  }
+}
+
+type SessionPayload = { username: string; role: UserRole; iat: number };
+type ParsedToken = { payload: SessionPayload; rawPayload: string; sig: string };
+
+/** Make a short token ~ "base64(payload).sig" */
+function encodeSession(p: SessionPayload): string {
+  const raw = Buffer.from(JSON.stringify(p)).toString("base64url");
+  const sig = sign(raw);
+  return `${raw}.${sig}`;
+}
+function decodeSession(token: string): ParsedToken | null {
+  const parts = token.split(".");
+  if (parts.length !== 2) return null;
+  const [raw, sig] = parts;
+  if (!verify(raw, sig)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as SessionPayload;
+    if (!payload?.username || !payload?.role) return null;
+    return { payload, rawPayload: raw, sig };
   } catch {
     return null;
   }
 }
 
-/** Check username/password against the fixed users list. Returns role or null. */
-export function validateUser(username: string, password: string): UserRole | null {
-  const u = USERS.find(
-    (x) => x.username.toLowerCase() === String(username || "").toLowerCase()
-  );
+/** PUBLIC: log in -> returns token + role + cookie maxAge */
+export async function loginUser(username: string, password: string) {
+  const u = findUser(String(username || ""), String(password || ""));
   if (!u) return null;
-  return u.password === password ? u.role : null;
+  const payload: SessionPayload = { username: u.username, role: u.role, iat: Math.floor(Date.now()/1000) };
+  const token = encodeSession(payload);
+  // 7 days
+  return { token, role: u.role, username: u.username, maxAge: 60 * 60 * 24 * 7 };
 }
 
-/** Helper to format a Set-Cookie header for the session cookie. */
-export function makeSessionCookie(token: string, maxAgeDays = 7) {
-  const maxAge = maxAgeDays * 86400;
-  // Path=/ makes the cookie available to the whole site; HttpOnly for security.
-  // Secure;SameSite=Lax is good for first-party auth.
-  return `${SESSION_COOKIE}=${token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
+/** PUBLIC: verify cookie -> user or null */
+export function verifySession(token: string | undefined | null) {
+  if (!token) return null;
+  const parsed = decodeSession(token);
+  if (!parsed) return null;
+  const { username, role } = parsed.payload;
+  const user = USERS.find(u => u.username === username && u.role === role);
+  if (!user) return null;
+  return { username, role, scopes: user.scopes };
 }
 
-/** Helper to clear the cookie. */
-export function clearSessionCookie() {
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0`;
+/** PUBLIC: cookie helpers for NextResponse */
+export function setSessionCookie(res: import("next/server").NextResponse, token: string, maxAgeSec: number) {
+  res.cookies.set(SESSION_COOKIE, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: true,
+    path: "/",
+    maxAge: maxAgeSec,
+  });
+}
+export function clearSessionCookie(res: import("next/server").NextResponse) {
+  res.cookies.set(SESSION_COOKIE, "", {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: true,
+    path: "/",
+    maxAge: 0,
+  });
+}
+
+/** Optional helper: route-level access */
+export function userHasAccess(pathname: string, role: UserRole, scopes: UserRow["scopes"]) {
+  if (role === "admin" || scopes.includes("all")) return true;
+  if (pathname.startsWith("/employees")) return scopes.includes("employees");
+  if (pathname.startsWith("/documents")) return scopes.includes("documents");
+  if (pathname.startsWith("/payroll"))   return scopes.includes("payroll");
+  if (pathname.startsWith("/reports"))   return scopes.includes("reports");
+  return false;
 }
