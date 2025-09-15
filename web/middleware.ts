@@ -21,7 +21,7 @@ export async function middleware(req: NextRequest) {
   }
 
   // Allow public routes
-  if (PUBLIC.some(rx => rx.test(pathname))) {
+  if (PUBLIC.some((rx) => rx.test(pathname))) {
     return NextResponse.next();
   }
 
@@ -30,11 +30,12 @@ export async function middleware(req: NextRequest) {
   if (!session) {
     const url = req.nextUrl.clone();
     url.pathname = "/login";
-    url.search = pathname && pathname !== "/" ? `?next=${encodeURIComponent(pathname)}` : "";
+    url.search =
+      pathname && pathname !== "/" ? `?next=${encodeURIComponent(pathname)}` : "";
     return NextResponse.redirect(url);
   }
 
-  // Optionally restrict by role example:
+  // Example role gating (uncomment to protect /admin)
   // const [, role] = session.split(":");
   // if (pathname.startsWith("/admin") && role !== "admin") {
   //   const url = req.nextUrl.clone();
