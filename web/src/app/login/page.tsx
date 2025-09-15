@@ -2,84 +2,64 @@
 "use client";
 
 import * as React from "react";
-import { Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
-import {
-  Box, Button, Paper, Stack, TextField, Typography,
-} from "@mui/material";
 
-function InnerLogin() {
-  const search = useSearchParams();
+export default function LoginPage() {
+  const params = useSearchParams();
   const router = useRouter();
-  const next = search.get("next") || "/";
+  const next = params.get("next") || "/";
 
   const [username, setUsername] = React.useState("");
   const [password, setPassword] = React.useState("");
   const [error, setError] = React.useState<string | null>(null);
-  const [busy, setBusy] = React.useState(false);
+  const [loading, setLoading] = React.useState(false);
 
-  const submit = async (e: React.FormEvent) => {
+  async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
-    setBusy(true);
     setError(null);
+    setLoading(true);
     try {
-      const r = await fetch("/api/login", {
+      const res = await fetch("/api/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
       });
-      if (!r.ok) throw new Error((await r.json()).error || "Login failed");
-      router.push(next);
-    } catch (err: any) {
-      setError(err?.message || "Login failed");
+      const data = await res.json();
+      if (!res.ok || !data.ok) {
+        setError(data?.error || "Login failed");
+      } else {
+        router.replace(next);
+      }
+    } catch (err) {
+      setError("Network error");
     } finally {
-      setBusy(false);
+      setLoading(false);
     }
-  };
+  }
 
   return (
-    <Box sx={{ minHeight: "100dvh", display: "grid", placeItems: "center", p: 2 }}>
-      <Paper elevation={3} sx={{ p: 3, width: 360 }}>
-        <Typography variant="h6" fontWeight={700} gutterBottom>
-          Sign in
-        </Typography>
-        <form onSubmit={submit}>
-          <Stack gap={2}>
-            <TextField
-              label="Username"
-              value={username}
-              autoFocus
-              onChange={(e) => setUsername(e.target.value)}
-            />
-            <TextField
-              label="Password"
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-            />
-            {error && <Typography color="error">{error}</Typography>}
-            <Button type="submit" variant="contained" disabled={busy}>
-              {busy ? "Signing in..." : "Sign in"}
-            </Button>
-          </Stack>
-        </form>
-        <Box sx={{ mt: 2 }}>
-          <Typography variant="body2" color="text.secondary">
-            admin / admin — full access<br />
-            danny / Yho — employees, documents<br />
-            heejung / Yho — employees, documents
-          </Typography>
-        </Box>
-      </Paper>
-    </Box>
-  );
-}
-
-export default function LoginPage() {
-  // Satisfy Next warning about useSearchParams during prerender
-  return (
-    <Suspense>
-      <InnerLogin />
-    </Suspense>
+    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", padding: 24 }}>
+      <form onSubmit={onSubmit} style={{ width: 360, display: "grid", gap: 12 }}>
+        <h1 style={{ margin: 0, textAlign: "center" }}>Sign in</h1>
+        <input
+          placeholder="Username"
+          value={username}
+          onChange={(e) => setUsername(e.target.value)}
+          autoFocus
+          style={{ padding: 10, fontSize: 16 }}
+        />
+        <input
+          placeholder="Password"
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          style={{ padding: 10, fontSize: 16 }}
+        />
+        {error && <div style={{ color: "crimson", fontSize: 14 }}>{error}</div>}
+        <button disabled={loading} type="submit" style={{ padding: 10, fontSize: 16 }}>
+          {loading ? "Signing in..." : "Sign in"}
+        </button>
+      </form>
+    </div>
   );
 }
