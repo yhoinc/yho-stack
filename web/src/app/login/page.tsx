@@ -2,9 +2,13 @@
 "use client";
 
 import * as React from "react";
+import { Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 
-export default function LoginPage() {
+// Optional: ensure this page is rendered dynamically (avoids prerender complaints)
+export const dynamic = "force-dynamic";
+
+function LoginInner() {
   const params = useSearchParams();
   const router = useRouter();
   const next = params.get("next") || "/";
@@ -61,5 +65,14 @@ export default function LoginPage() {
         </button>
       </form>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  // Wrap useSearchParams() usage in Suspense per Next.js guidance
+  return (
+    <Suspense fallback={<div />}>
+      <LoginInner />
+    </Suspense>
   );
 }
