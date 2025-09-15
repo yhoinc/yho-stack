@@ -15,7 +15,7 @@ export async function loginUser(username: string, password: string) {
   const rec = USERS[username];
   if (!rec || rec.password !== password) return null;
   const token = `${username}:${rec.role}`; // "username:role"
-  const maxAge = 60 * 60 * 12; // 12h
+  const maxAge = 60 * 60 * 12; // 12 hours
   return { token, role: rec.role, username, maxAge };
 }
 
